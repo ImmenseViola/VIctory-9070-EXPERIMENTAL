@@ -223,6 +223,20 @@ fn tex_view_cache() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the texture pass gives up on a due slot whose raw view can never
+/// name a host texture (`VICTORY_TEX_SKIP_NOVIEW=1`; off by default; A/B-able
+/// with `VICTORY_AB=<s>,VICTORY_TEX_SKIP_NOVIEW`). This is checked only after
+/// the room and residency gates, and only for view kinds the normal path
+/// discards at the same point without an upload.
+fn tex_skip_noview() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_TEX_SKIP_NOVIEW") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_SKIP_NOVIEW").is_some_and(|v| v == "1"))
+}
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2421,6 +2435,7 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let view_cache = tex_view_cache();
+        let skip_noview = tex_skip_noview();
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -2594,6 +2609,21 @@ impl State {
             if !crate::residency::admit_texture_pass(required) {
                 served = false;
                 break;
+            }
+            // Experimental `VICTORY_TEX_SKIP_NOVIEW`: these kinds are thrown
+            // away by the ordinary path just below (it only accepts a shader
+            // view of a texture), without an upload or a retry. Taking them
+            // here avoids a mirror and several slot lookups. Placed buffers
+            // are left alone; their mapped state above may still be due.
+            if skip_noview
+                && matches!(
+                    raw_view().as_ref(),
+                    Some(View::Constant(..) | View::Sampler(..) | View::ConsoleSampler(..) | View::Unordered(..))
+                        | Some(View::Placed(true, ..))
+                )
+            {
+                host.texture_slot_done(index, write, None);
+                continue;
             }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
