@@ -71,8 +71,10 @@ camera keys, so phases 4–7 share one scene.
 | Median | 51.0 → 48.2 | −2.8 ms | matched |
 | p90 | 89.6 → 82.2 | −7.4 ms | matched |
 
-Frames stayed 96.7% non-black; private 25.8 GB at stop. Verdict: clean dense
-matched win. The switch was then made the default **in this fork only**.
+Frames stayed 96.7% non-black; private 25.8 GB at stop. The win is mostly in
+mean (4.5–7.8 ms) and p90 (2.8–7.4 ms); medians moved only 1–3 ms, so the cache
+mainly helps worst frames. Verdict: clean dense matched win. The switch was
+then made the default **in this fork only**.
 
 ### `texview-visual1` — user visual check, series X
 
@@ -108,14 +110,18 @@ roughly 18 ms of the dense mean has to go.
 
 ## Open work
 
-- Find a multi-millisecond CPU cut: copy-back and copy recording are the two
-  largest measured pieces after the texture view cache.
-- Game A/B of `VICTORY_TEX_SKIP_NOVIEW`, alone and then combined with the
-  view cache.
-- `VICTORY_TEX_HOST_CACHE` and `VICTORY_TEX_QUEUE_BATCH` experiments.
+- Find a multi-millisecond CPU cut: copy recording (15.2 ms) and copy-back
+  (10.5 ms) are the two largest measured pieces; the texture pass is only
+  1.5 ms now. Sub-ms texture cuts cannot reach 30 fps.
+- Draw-time mirror-safety trace for `VICTORY_TEX_SKIP_NOVIEW`. It skips
+  `host.mirror` bookkeeping, so the game A/B is blocked until every binding
+  path for those view kinds is shown to mirror first.
+- `VICTORY_TEX_HOST_CACHE` and `VICTORY_TEX_QUEUE_BATCH` are parked sub-ms
+  cuts, not part of the 30 fps path.
 - Full heap-texture aside only after the ahead-job refactor is safe.
 - Memory wall (~30 GB private) and dense driving dips remain separate
-  stability problems; no switch here claims to solve them.
+  stability problems; no switch here claims to solve them. The promotion test
+  is "no worse than baseline on memory", not a fix of this wall.
 - Vegetation distance fade is suspected by the user to be a RAM/streaming
   ceiling rather than ordinary LOD. Parked by request until the multi-ms CPU
   work is done; no change has been made for it.
