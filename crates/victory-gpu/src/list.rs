@@ -203,6 +203,15 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// With `VICTORY_BATCH_SLOTS=1`, give this list's dynamic descriptor slots
+    /// back as soon as its submission has landed, instead of holding them
+    /// until the title resets the list 64 submissions later.
+    pub(crate) fn release_tables(&mut self) {
+        if crate::host::batch_slots() {
+            self._state.tables_done();
+        }
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

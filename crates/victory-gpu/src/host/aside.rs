@@ -43,6 +43,12 @@ impl Coming {
 }
 
 pub(crate) fn on() -> bool {
+    // `VICTORY_AB=<s>,VICTORY_HEAP_PASS_ASIDE` compares the thread against
+    // doing the pass where it is needed; the env default is unchanged.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_PASS_ASIDE") {
+        return on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_ASIDE").is_none_or(|v| v != "0"))
 }

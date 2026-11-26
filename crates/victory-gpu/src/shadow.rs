@@ -3718,10 +3718,11 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            note_stale(0);
-            return true;
-        }
+        // A copy whose refresh could not ask the watch keeps its NOT_WATCHED
+        // mark, but that must not make every flight over it wait: the
+        // reference below holds the bytes the copy had before the flight, so
+        // the pages can be compared directly. Only when there is no reference
+        // (or too many changed runs) does the settle remain necessary.
         // The declared ranges overlap (views of the title's whole heap from
         // dozens of offsets): as one range each page is asked about and
         // compared once. Every byte of it is in a declared range, and of a
@@ -3737,9 +3738,18 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
+            let (now, written) = match crate::watch::writes(a, e, true) {
+                Some(known) => known,
+                None => {
+                    // No watch can say which pages the title wrote. Compare
+                    // every page of the span with the reference instead: a
+                    // fresh asking number makes `stale_pages_in` take them
+                    // all, and `merge_page_under_writes` keeps only the dwords
+                    // that really differ, so shader-only writes survive.
+                    let now = crate::watch::next_asking();
+                    let written = (a / PAGE..e.div_ceil(PAGE)).map(|page| (page, now)).collect();
+                    (now, written)
+                }
             };
             let t = under_ns(0, t);
             let stale: Vec<usize> = {

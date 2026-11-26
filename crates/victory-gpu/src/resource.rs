@@ -2995,10 +2995,17 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
+/// (address and description): for [`PLACED_TWINS`]. Only a bounded sample is
+/// kept; this set is a diagnostic count, not a cache, and letting it grow
+/// for the whole run cost millions of small allocations.
 #[cfg(windows)]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Most entries kept in [`PLACED_RAW`] before the diagnostic count stops
+/// learning new ones. 64 KiB of keys is ample for a twin-rate estimate.
+#[cfg(windows)]
+const PLACED_RAW_MAX: usize = 1 << 16;
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
@@ -3101,7 +3108,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // the log: `placed_filler_twins`).
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
+        let asked = (address, raw);
+        if !seen.contains(&asked) && seen.len() < PLACED_RAW_MAX {
+            seen.insert(asked);
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
                 blank[1] = 0;
