@@ -98,7 +98,7 @@ Game A/B protocol:
 | Run | Outcome |
 |---|---|
 | `texview-ab1` | Clean cycle, but world entry and camera/draw swings confounded phases 4–7. Only matched pair: 33.4 ms on vs 37.9 ms off at 6–8 draws. Suggests a win; not enough to promote. |
-| `texview-ab2` | Enter-only schedule after world entry so phases 4–7 share one scene. Pending. |
+| `texview-ab2` | Clean matched dense pairs at ~5.83k draws. Phase 4 off 70.9 ms mean / 53.0 median / 94.3 p90 vs phase 5 on 63.1 / 52.0 / 88.6. Phase 6 off 64.3 / 51.0 / 89.6 vs phase 7 on 59.8 / 48.2 / 82.2. About 4.5–7.8 ms mean and 2.8–7.4 ms p90 better with the cache. Frames stayed 96.7% non-black; private 25.8 GB at stop. |
 
 Promotion requires a clean dense matched A/B, stable memory, and a visual
 check by the user. Nothing is promoted to the tuned tree until then.
