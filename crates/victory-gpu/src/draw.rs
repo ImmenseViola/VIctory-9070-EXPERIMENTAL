@@ -206,6 +206,23 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether the pass that uploads textures picked by index reads a slot's heap
+/// handle and raw descriptor view once, rather than on every look at that
+/// slot (`VICTORY_TEX_VIEW_CACHE=1`; off by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE`). The title can write a descriptor
+/// while the pass runs, so a cached view is deliberately an experiment and is
+/// kept away from the tuned tree.
+fn tex_view_cache() -> bool {
+    // `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE` compares the cache against
+    // reading the descriptor each time in one run.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_TEX_VIEW_CACHE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_some_and(|v| v == "1"))
+}
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2403,12 +2420,35 @@ impl State {
         };
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
+        let view_cache = tex_view_cache();
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
             }
+            // Experimental `VICTORY_TEX_VIEW_CACHE`: one read of the slot's
+            // handle and one read of its raw view, reused by the looks below.
+            // With the switch off these are exactly the old reads, at the old
+            // points; the cells cost nothing but two flags when unused.
+            let handle_cell = std::cell::OnceCell::new();
+            let raw_view_cell = std::cell::OnceCell::new();
+            let handle = || {
+                if !view_cache {
+                    heap.handle(index)
+                } else {
+                    *handle_cell.get_or_init(|| heap.handle(index))
+                }
+            };
+            let raw_view = || {
+                if !view_cache {
+                    heap.handle(index).and_then(crate::descriptor::view)
+                } else {
+                    raw_view_cell
+                        .get_or_init(|| handle().and_then(crate::descriptor::view))
+                        .clone()
+                }
+            };
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2453,7 +2493,7 @@ impl State {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
-                    let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
+                    let first = raw_view().map_or(0, |view| match view {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
@@ -2472,7 +2512,7 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) = raw_view() {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
@@ -2502,7 +2542,7 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) = raw_view()
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -2524,7 +2564,7 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                    && handle().is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
@@ -2560,18 +2600,20 @@ impl State {
             // the new one shows has run.
             let shows_other = !baking
                 && crate::resource::held_only()
-                && heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle));
+                && handle().is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !shows_other
                 && !baking
                 && crate::descriptor::host::show_after()
-                && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-            });
+                && handle().is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let view = if shows_other || late {
+                raw_view()
+            } else {
+                handle().and_then(|handle| host.mirror(index, handle, true))
+            };
             let at_once = || {
-                if late && let Some(handle) = heap.handle(index) {
+                if late && let Some(handle) = handle() {
                     let _ = host.mirror(index, handle, true);
                 }
             };
@@ -2604,12 +2646,12 @@ impl State {
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
-                if shows_other && let Some(handle) = heap.handle(index) {
+                if shows_other && let Some(handle) = handle() {
                     let _ = host.mirror(index, handle, true);
                 }
                 // Its bytes are in, or on the way there in a list before.
                 if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                    if let Some(handle) = heap.handle(index) {
+                    if let Some(handle) = handle() {
                         host.texture_slot_show_after(list, index, handle);
                     }
                 } else {
@@ -2636,7 +2678,7 @@ impl State {
             if let Some(ahead) = &ahead {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
-                if let Some(handle) = heap.handle(index) {
+                if let Some(handle) = handle() {
                     host.texture_slot_show_ahead(job, index, handle);
                 }
                 if let Taken::New(job) = ahead {
@@ -2667,10 +2709,10 @@ impl State {
                 note(if waited { Kind::Waited } else { Kind::Ready }, since);
                 note(Kind::Noticed, away);
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
+            if shows_other && let Some(handle) = handle() {
                 host.texture_slot_flip(list, index, handle);
             }
-            if late && let Some(handle) = heap.handle(index) {
+            if late && let Some(handle) = handle() {
                 host.texture_slot_show_after(list, index, handle);
             }
             #[cfg(feature = "diagnostics")]
