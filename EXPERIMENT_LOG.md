@@ -334,18 +334,85 @@ So the largest targets are inside refresh flushes (especially the 6.86 ms of
 not the 2.18 ms of batch recording, the 1.5 ms texture pass, or the 1.27 ms
 fence wait. No optimisation has been chosen or written from this breakdown.
 
+#### Whole-frame critical path (`copy-stages-4` and `copy-stages-5`)
+
+The follow-up rounds added a submitting-thread wall split, relay waits, a
+refresh-flush wall split, and `find_pieces` byte/pending coverage, all behind
+`VICTORY_COPY_STAGES=1`. `copy-stages-5` used the warmed version-3 cache,
+series S, upscaler 6, `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_LATE_WAIT=3`,
+Enter-only after world entry, and no manual input. The passive monitor saw
+visible gameplay (`Americas`, luma 88.8–121.7, non-black 86.5–96.9%,
+private 22.32–23.33 GB, 5,352 and 9,039 draws at the two samples). The
+watcher stopped it after 210 stage lines with no shader/pipeline work active.
+The representative window 23:25:40–23:27:30 UTC has 96 critical, flush and
+`find_pieces` samples plus 20 frame lines with at least 3,000 draws:
+
+| Submitting thread | Mean ms/frame | Share of frame |
+|---|---:|---:|
+| whole frame | 45.22 | 100% |
+| in submissions | 38.36 | 84.8% |
+| title work/elsewhere | 6.50 | 14.4% |
+| waiting outside submissions for the relay | 0.35 | 0.8% |
+
+The submission part splits as: lists' steps 18.03, heap waits 8.65, asking
+4.17, snapshots 2.16, card copies 1.98, bytes under flights 1.38, sending
+0.95, card steps 0.55, sweep/gather 0.09, flight waits 0.39 (p90 1.21, max
+4.29) and lock 0.01 ms. Nested in those segments, not additive: refresh
+11.94, copies/fills 2.31 (overlapping the refresh timer), and span walking
+0.39 ms. `copy-stages-4` independently measured 47.34 ms frame, 40.41 ms in
+submissions, 19.75 ms lists, 13.43 ms refresh and 8.95 ms heap waits over 88
+samples, so the split is repeatable rather than one window's skew.
+
+Relay waits on the submitting thread are effectively zero: 0.00 ms inside
+submissions and 0.35 ms outside in the corrected round (0.001 present, 0.352
+read; every other reason 0.00). Pipeline waits were 0.00 ms. The frame line's
+10.78 ms "copying back" is real CPU work but is not on the submitting
+thread's wait path, so cutting it cannot directly shorten the 45 ms critical
+path; it could only matter indirectly through CPU/memory contention.
+
+Refresh flushes: the stage timer is 11.08 ms, and the parallel part's 11.26 ms
+wall is 0.135 ms dispatch/queueing + 9.89 ms work on the submitting thread +
+1.23 ms join/wait. The workers' summed CPU is 33.80 ms across 104.5 worker
+jobs/frame (about 3.2 per flush over 32.6 flushes), 0.324 ms for the average
+worker job and 0.326 ms for the slowest worker in each flush; actual
+`Shadow::update` is 16.27 ms of that summed CPU. The caller's 9.89 ms, not
+worker starvation or the 1.23 ms join, is the part to cut.
+
+`find_pieces` checked 38.44 MB against snapshots, found 10.45 MB (27.2%)
+different, and 38.44 MB — effectively all of the declared ranges — was
+covered by pending UAV writes. A pending-range-only or pending-skip copy-back
+therefore has almost no headroom and cannot discard the bytes that do differ.
+
+Re-ranking after these measurements:
+
+1. **Candidate A — per-shadow interval index plus per-flush span union** stays
+   first. It attacks the 11.94 ms nested refresh and its 9.89 ms caller wall.
+   Still an unproven 0.5–1.5 ms estimate; no code has been written.
+2. **New: heap-wait attribution** is second, as a diagnostic before any cut.
+   The 8.65 ms `begin_sync_heaps` wait is the second-largest submission
+   segment and is directly on the critical path, but its mechanism is not
+   known yet.
+3. **Candidate B — incremental declared-range joining/ordering** is off the
+   table for the direct 30 fps path. The submitting thread does not wait on
+   the relay or landing; a copy-back cut only helps if it also relieves CPU
+   contention, which this round did not establish.
+4. **Pending-range-only copy-back** is also off the table: pending coverage is
+   38.44/38.44 MB, with 27.2% of those bytes genuinely changed.
+
+No optimisation or switch default changed in these rounds.
+
 ## Open work
 
-- Find a multi-millisecond CPU cut: the measured breakdown now says where it
-  is. Of the 13.47 ms "copies", 10.46 ms is refresh flushes and 6.86 ms of
-  that is finding spans that copy nothing; batch recording is only 2.18 ms.
-  Of the 10.66 ms "copying back", 8.48 ms is the residual of finding pieces,
-  scanning, merging and ranges, not the 1.27 ms fence wait. The texture pass
-  is only ~1.5 ms, so sub-ms texture cuts cannot reach 30 fps. Bus-traffic
-  composition is above, but the big buffers sit above 4 GiB, outside
-  `port::place_for`'s low-4-GiB graphics region; placing them in title memory
-  would reintroduce PCIe-bound shader reads. A byte/order-preserving change
-  must target the measured stages, not the whole batch blindly.
+- Find a multi-millisecond CPU cut on the submitting thread. Its 45 ms frame
+  is 38 ms in submissions; within that, lists' steps 18 ms (refresh 11.94 ms
+  nested, caller wall 9.89 ms) and heap waits 8.65 ms dominate. Copy-back's
+  10.78 ms is real CPU work but the submitter does not wait for it, so it is
+  not the direct critical path. The texture pass is only ~1.5 ms, so sub-ms
+  texture cuts cannot reach 30 fps. Bus-traffic composition is above, but the
+  big buffers sit above 4 GiB, outside `port::place_for`'s low-4-GiB graphics
+  region; placing them in title memory would reintroduce PCIe-bound shader
+  reads. A byte/order-preserving change must target the measured stages, not
+  the whole batch blindly.
 - The texture no-view early-finish switch was dropped: restoring `host.mirror` removed its only substantial saving, so it was not worth an A/B.
 - Parked sub-ms texture cuts are not part of the 30 fps path.
 - `VICTORY_HEAP_SYNC_EARLY` A/B is done: no regression, possible 1–2 ms,

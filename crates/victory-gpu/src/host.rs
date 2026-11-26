@@ -8142,8 +8142,8 @@ fn refresh_flush_line(frames: f64, stage_ms: f64) {
     tracing::info!(
         "refresh flush workers per frame: {stage_ms:.2} ms stage; the parallel part's {wall:.2} ms = {dispatch:.2} ms \
          dispatch/queueing + {caller:.2} ms work on the submitting thread + {join:.2} ms join/wait; the workers' summed CPU \
-         was {busy:.2} ms ({avg:.2} ms for the average worker, slowest worker {slowest:.2} ms in each of {flushes:.0} \
-         flushes, {count:.0} workers); actual shadow updates were {copies:.2} ms of that CPU (VICTORY_COPY_STAGES=1)",
+         was {busy:.2} ms ({avg:.2} ms for the average worker job, slowest worker {slowest:.2} ms in each of {flushes:.0} \
+         flushes, {count:.0} worker jobs); actual shadow updates were {copies:.2} ms of that CPU (VICTORY_COPY_STAGES=1)",
         wall = t[FLUSH_WIDE_WALL],
         dispatch = t[FLUSH_WIDE_DISPATCH],
         caller = t[FLUSH_WIDE_CALLER],

@@ -161,32 +161,38 @@ tracked in `EXPERIMENT_LOG.md`, but it is not a reason to blame this cache.
 
 ## Next cuts, in order
 
-Measured dense series-S frames spend 15.2 ms in copy recording and 10.5 ms in
-copy-back, versus 1.5 ms in the texture pass. Even perfect texture cuts cannot
-supply the ~18 ms needed for 30 fps, so the order is:
+The submitting thread's 45 ms frame is 38 ms in submissions: lists' steps
+18 ms (with 11.94 ms nested refresh and 9.89 ms caller wall), heap waits
+8.65 ms, asking 4.17 ms, then smaller segments. It waits 0.35 ms on the relay
+outside submissions and 0.00 ms inside them, so copy-back's 10.78 ms is real
+CPU work but not the direct critical path. Even perfect texture cuts cannot
+supply the ~15 ms needed for 30 fps, so the order is:
 
-1. **Copy recording** — stage timing (`VICTORY_COPY_STAGES=1`) split the
-   representative 13.47 ms "copies" into 10.46 ms refresh flushes, 2.18 ms
-   batch recording, 0.35 ms ask_ahead, 0.24 ms deferred fills and 0.00 ms
-   serial prefilters. Within the flushes, 6.86 ms was finding spans that copy
-   nothing, mostly on front workers (5.22 ms) and all-flush workers (1.57 ms).
-   Span gathering outside "copies" was 2.17 ms. Do not simply place the big
-   buffers in title memory: they sit above 4 GiB and `port::place_for` only
-   covers the low 4 GiB graphics region; moving them would bring back
-   PCIe-bound shader reads. Start at `host.rs::run_deferred` and
+1. **Candidate A — per-shadow interval index plus per-flush span union** —
+   attacks the 11.94 ms nested refresh and its 9.89 ms caller wall. Estimated
+   0.5–1.5 ms, not yet proven. Start at `host.rs::run_deferred` and
    `host.rs::Batch`, preserving copied bytes and every refresh's position
-   relative to title and shader writes.
-2. **Copy-back** — stage timing split the 10.66 ms into 8.48 ms finding pieces,
-   scanning beside the fetch, merging and ranges, 1.27 ms waiting for the
-   fetch fence, and 0.90 ms recording/sending the fetch. Cut the residual,
-   not the fence wait, without changing read-back results.
-3. `VICTORY_HEAP_SYNC_EARLY` — A/B done: no regression, possible 1–2 ms,
-   mechanism unconfirmed. The run used the movement schedule and the two sides
-   saw different frames; only one pair was convincing. Early rounds are already
-   the default, so no action. Future A/Bs use Enter-only after world entry.
-4. Parked sub-ms texture cuts — not part of the 30 fps path.
-5. Full heap-texture aside — only after an ahead-job refactor that can carry
+   relative to title and shader writes. Do not place the big buffers in title
+   memory: they sit above 4 GiB and `port::place_for` only covers the low 4 GiB
+   graphics region, so moving them would reintroduce PCIe-bound shader reads.
+2. **Heap-wait attribution** — a diagnostic before any cut. The 8.65 ms
+   `begin_sync_heaps` wait is directly on the critical path, but why it waits
+   is not yet known.
+3. **Candidate B — incremental declared-range joining/ordering** — off the
+   table for the direct 30 fps path. The submitter does not wait on the relay
+   or landing; copy-back would only help indirectly through CPU contention.
+4. **Pending-range-only copy-back** — off the table. Pending UAV writes cover
+   38.44 of 38.44 MB compared, and 27.2% of those bytes really differ; there
+   is nothing safe to skip.
+5. `VICTORY_HEAP_SYNC_EARLY` — A/B done: no regression, possible 1–2 ms,
+   mechanism unconfirmed. Early rounds are already the default, so no action.
+   Future A/Bs use Enter-only after world entry.
+6. Parked sub-ms texture cuts — not part of the 30 fps path.
+7. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.
+
+No optimisation code has been written from the diagnostics; the user must
+choose a cut before implementation.
 
 Parallel filtering of live descriptor/title state is parked; it would change
 which bytes upload.
