@@ -26,9 +26,22 @@ Typical A/B launch:
     VICTORY_CARD_BUFFERS_MIN_MB='1'
     VICTORY_LATE_WAIT='3'
     VICTORY_AB='20,VICTORY_TEX_VIEW_CACHE'
-    VICTORY_KEYS='2:Enter,5:Enter,8:Enter,11:Enter,75:Enter,78:Enter'
+    VICTORY_KEYS='2:Enter,5:Enter,8:Enter,11:Enter,20:Enter,75:Enter,78:Enter'
   }
 ```
 
 Start the monitor and watcher in the background, then let the watcher stop the
-run. Do not send manual input during an automated A/B.
+run. Do not send manual input during an automated A/B. Use the Enter-only
+schedule after world entry (as above); movement/camera keys make phases see
+different scenes and confound the result.
+
+For a stage breakdown without changing any switch under test, use the same
+launch with `VICTORY_COPY_STAGES='1'` in `-Extra` and no `VICTORY_AB`. The
+diagnostics build then prints a `copy recording stages per frame` line beside
+the frame line, and a copy-back wait/fetch/book line with that same interval's
+total.
+`VICTORY_REFRESH_CHECK='1'` adds only the verification stage's time when that
+correctness probe is wanted; leave it off for a representative timing sample.
+The launcher's default binary is `target\diag\victory.exe`; pass `-Binary` only
+to override it. A stale `target-exp\diag` binary once produced a stage run
+with no breakdown lines, so check the binary before trusting a log.

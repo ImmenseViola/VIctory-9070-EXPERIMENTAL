@@ -148,16 +148,19 @@ the remaining 50 calls.
   gameplay (mean luma 88.7→101.6, non-black 97.0→87.5%, 19.9→22.8 GB private),
   but the route/matched-draw requirement was not met.
 
-- `heapsync-ab2` was clean: no manual input, warmed cache, series-S, and the
-  stopper ended at phase 7 with phases 4–7 all above 5.4k draws. Passive monitor
-  saw active gameplay (mean luma 118.2 and 101.6, non-black 96.7% and 87.7%,
-  private 22.1→23.0 GB). Phase 4/5 were 50.7/48.2 ms at 5,988/5,492 draws;
-  phase 6/7 were 48.3/46.9 ms at 5,603/5,859 draws. Grouped, the current early
-  default (`bits=1`, early rounds on) was 47.55 ms mean / 45.9 ms median at
-  5,676 draws, against 49.5 ms / 48.0 ms at 5,796 draws with early rounds off.
-  That is a ~2 ms win, but the measured end wait for heap records did not fall
-  (9.9 ms off vs 10.8 ms on), so the mechanism is not confirmed. No default is
-  changed by this run; the early rounds are already the current default.
+- `heapsync-ab2` had no manual input and stopped at phase 7 with phases 4–7
+  above 5.4k draws, but it used the movement schedule that confounded
+  `texview-ab1`, not that run's Enter-only-after-world-entry schedule. The
+  passive monitor also saw different frames between sides (non-black 96.7% vs
+  87.7%, luma 118 vs 102). Pair 1 had ~500 fewer draws on the on side
+  (50.7/48.2 ms at 5,988/5,492 draws); only pair 2 is convincing
+  (48.3/46.9 ms at 5,603/5,859 draws). Grouped numbers were 47.55 ms mean /
+  45.9 ms median at 5,676 draws with early rounds on, against 49.5 ms / 48.0 ms
+  at 5,796 draws with them off, and private stayed 22.1→23.0 GB. Verdict: **no
+  regression, possible 1–2 ms, mechanism unconfirmed** — the end wait for heap
+  records did not fall (9.9 ms off vs 10.8 ms on). Early rounds are already the
+  default, so no action follows from this run. Future A/Bs use Enter-only after
+  world entry, as in `texview-ab2`.
 
 ### Fetch-heavy `0x962440000` — read-touch evidence needed
 
@@ -253,29 +256,102 @@ notes, and remap/open events; the current
 order (`host.rs:5840-5898`) is the ordering contract. Extra bytes can overwrite
 newer title/shader writes; missing bytes leave the card copy stale.
 
-**Verdict:** no code yet. First add reason counters to `Shadow::nothing_new`,
-tag each `FLUSHES[2]` increment with its site, and verify a sampled set of
-skipped spans with the `refresh_check` read-only pattern
-(`shadow.rs:4061-4115`). Then A/B with `VICTORY_REFRESH_CHECK=1` and
-`VICTORY_UPCOPY_CHECK=1`, plus `WATCH_CAP`, `PAGE_PARTS=0` and
-`PORT_GUARD_PLAN` stress cases. Moving the predicate back onto the submitting
-thread would move the 9.7 ms, not remove it (`watch.rs:1563-1571`).
+**Verdict:** no optimisation code yet. The write-up first established the
+byte/ordering contract; stage timing was added next as described below. A
+sampled set of skipped spans can still be checked with the `refresh_check`
+read-only pattern (`shadow.rs:4061-4115`), followed by A/B with
+`VICTORY_REFRESH_CHECK=1` and `VICTORY_UPCOPY_CHECK=1`, plus `WATCH_CAP`,
+`PAGE_PARTS=0` and `PORT_GUARD_PLAN` stress cases. Moving the predicate back
+onto the submitting thread would move the 9.7 ms, not remove it
+(`watch.rs:1563-1571`).
+
+### Stage instrumentation, before any optimisation
+
+`VICTORY_COPY_STAGES=1` in a diagnostics build now prints a second line beside
+the frame line. It mirrors every existing `PREPARING[0]` addition and
+subtraction, so `batch recording + refresh flushes + serial prefilters +
+deferred fills + ask_ahead + unattributed` equals the frame line's "copies".
+`refresh_check` and the per-span `nothing_new` checks are shown as nested
+"within those" times, not added twice. Span gathering/walking and the
+submission's copy segment are shown as outside "copies" because the existing
+frame line never counted them there. Per-span timing is gated because there
+are thousands of `nothing_new` calls a frame; without the gate only whole
+blocks are timed.
+
+`copying back` is split in the relay landing only: fence wait, fetch
+recording/sending, and a residual for finding pieces, scanning beside the
+fetch, merging and range notes. The three parts add up to `COPY_BACK[0]` for
+every landing. Both breakdown lines are swapped immediately after their frame
+line's counter, so the parts and the total come from the same report interval;
+small negative residuals can still occur when a worker adds after the total's
+swap, but window averages close. There is no behaviour change: no ordering,
+bytes, waits or switch defaults move.
+
+#### Measured breakdown (`copy-stages-2`)
+
+The first attempt (`copy-stages-1`) was discarded: the launcher still used a
+stale `target-exp\diag` binary, so no stage lines were printed. The launcher
+default now points at `target\diag`, and the Enter-only schedule includes the
+20 s world-entry Enter again.
+
+The representative window is 22:31:20–22:35:30 UTC after automatic world
+entry: 110 stage samples and 47 frame samples with at least 3000 draws and at
+most 100 ms/frame. The passive monitor showed visible gameplay throughout
+(luma 89.5–116.1, non-black 87.8–97%, private 22.7→25.3 GB). In that window
+the frame line averaged 54.3 ms/frame, 18.6 fps, 13.38 ms "copies", 10.23 ms
+"copying back", and 7200 draws/frame.
+
+`copies` averaged 13.47 ms over the stage samples; the six printed inside
+stages summed to 13.469 ms, so the mirror closes to round-off:
+
+| Stage | Mean ms/frame | Share of copies |
+|---|---:|---:|
+| refresh flushes | 10.46 | 77.6% |
+| batch recording | 2.18 | 16.2% |
+| ask_ahead | 0.35 | 2.6% |
+| deferred fills | 0.24 | 1.7% |
+| unattributed residual | 0.24 | 1.8% |
+| serial prefilters | 0.00 | 0.0% |
+
+Within those, finding spans that copy nothing took 6.86 ms/frame: front-flush
+workers 5.22 ms, all-flush workers 1.57 ms, before-shader-writes 0.07 ms, and
+the submitting thread's serial prefilter about 0.00 ms. `VICTORY_REFRESH_CHECK`
+was off, so its timed stage was 0.00 ms. Outside the frame line's "copies",
+span gathering/walking took 2.17 ms/frame and the submission's copy segment
+18.26 ms/frame; neither is added into "copies".
+
+`copying back` averaged 10.66 ms over 241 report samples (the frame line in
+the same window averaged 10.23 ms):
+
+| Part | Mean ms/frame | Share |
+|---|---:|---:|
+| finding pieces, scanning beside the fetch, merging and ranges | 8.48 | 79.6% |
+| waiting for a fetch's fence | 1.27 | 11.9% |
+| recording and sending the fetch copy | 0.90 | 8.5% |
+
+So the largest targets are inside refresh flushes (especially the 6.86 ms of
+`nothing_new` checks on parallel workers) and the 8.48 ms copy-back residual,
+not the 2.18 ms of batch recording, the 1.5 ms texture pass, or the 1.27 ms
+fence wait. No optimisation has been chosen or written from this breakdown.
 
 ## Open work
 
-- Find a multi-millisecond CPU cut: copy recording (15.2 ms) and copy-back
-  (10.5 ms) are the two largest measured pieces; the texture pass is only
-  1.5 ms now. Bus-traffic composition is above, but the big buffers sit above
-  4 GiB, outside `port::place_for`'s low-4-GiB graphics region; placing them in
-  title memory would reintroduce PCIe-bound shader reads. The next step is a
-  byte/order-preserving change to copy recording (`host.rs::run_deferred`,
-  `host.rs::Batch`), where ~6900 of ~7900 refresh spans per frame are known to
-  copy nothing. Sub-ms texture cuts cannot reach 30 fps.
+- Find a multi-millisecond CPU cut: the measured breakdown now says where it
+  is. Of the 13.47 ms "copies", 10.46 ms is refresh flushes and 6.86 ms of
+  that is finding spans that copy nothing; batch recording is only 2.18 ms.
+  Of the 10.66 ms "copying back", 8.48 ms is the residual of finding pieces,
+  scanning, merging and ranges, not the 1.27 ms fence wait. The texture pass
+  is only ~1.5 ms, so sub-ms texture cuts cannot reach 30 fps. Bus-traffic
+  composition is above, but the big buffers sit above 4 GiB, outside
+  `port::place_for`'s low-4-GiB graphics region; placing them in title memory
+  would reintroduce PCIe-bound shader reads. A byte/order-preserving change
+  must target the measured stages, not the whole batch blindly.
 - The texture no-view early-finish switch was dropped: restoring `host.mirror` removed its only substantial saving, so it was not worth an A/B.
 - Parked sub-ms texture cuts are not part of the 30 fps path.
-- `VICTORY_HEAP_SYNC_EARLY` A/B is done: the current early default measured
-  ~2 ms better in the clean dense cycle, but its end wait did not fall, so it
-  is not a proven mechanism. No default change; copy recording is next.
+- `VICTORY_HEAP_SYNC_EARLY` A/B is done: no regression, possible 1–2 ms,
+  mechanism unconfirmed and confounded by movement/frame differences. Early
+  rounds are already the default; no action. Copy stage timing is also done;
+  the numbers above direct the next optimisation.
 - Full heap-texture aside only after the ahead-job refactor is safe.
 - Memory wall (~30 GB private) and dense driving dips remain separate
   stability problems; no switch here claims to solve them. The promotion test

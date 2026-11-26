@@ -4072,6 +4072,8 @@ impl Shadow {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         const SAMPLE: usize = 256;
         // Blocks found differing: how many refreshes in a row.
         static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
@@ -4113,6 +4115,8 @@ impl Shadow {
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::host::note_copy_stage(crate::host::COPY_REFRESH_CHECK, began.elapsed().as_micros() as u64);
     }
 
     /// Copies the pages of `[from, to)` written after their last copy

@@ -6,7 +6,7 @@ param(
     [switch] $Guard,
     [switch] $NoPanel,
     [string] $Cache = 'C:\mygame\victory-work\victory-7900-clean-cache-1',
-    [string] $Binary = 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target-exp\diag\victory.exe'
+    [string] $Binary = 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target\diag\victory.exe'
 )
 
 $repo = 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL'
@@ -33,6 +33,8 @@ $settings = @{
     VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'
     VICTORY_UPSCALER=$Upscaler; VICTORY_OUTPUT='1920x1080'
     VICTORY_RESIDENCY='1'; VICTORY_ASYNC_SUBMIT='1'; VICTORY_LATE_WAIT='1'
+    # Enter-only schedule: no movement/camera keys after world entry, so A/B phases share one scene.
+    # The 20 s Enter is world entry; without it the run sits at a menu until a human presses it.
     VICTORY_KEYS='2:Enter,5:Enter,8:Enter,11:Enter,20:Enter,75:Enter,78:Enter'
     VICTORY_LOG='info'
 }

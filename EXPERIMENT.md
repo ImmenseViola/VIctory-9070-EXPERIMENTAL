@@ -87,13 +87,15 @@ a separate host-side harness and stays blocked.
 - watcher stops at phase 7 or 29.5 GB private and refuses to kill during
   shader/pipeline creation
 - no manual input during automated runs
+- Enter-only key schedule including world entry (`2/5/8/11/20/75/78:Enter`),
+  no movement or camera keys, so matched phases share one scene
 
-The next one-variable run uses the same route with
-`VICTORY_AB=20,VICTORY_HEAP_SYNC_EARLY`: dense frames spend ~10.4 ms at the
-end of submission waiting for heap records, while the background round itself
-costs only ~4.7 ms across all threads. It changes when the existing descriptor
-round runs, not which bytes upload. Compare frame ms, the end-wait line,
-private memory, then do a visual check before any default change.
+`VICTORY_AB=20,VICTORY_HEAP_SYNC_EARLY` is done: no regression, possible 1–2 ms,
+mechanism unconfirmed and confounded by movement/frame differences. Early rounds
+are already the default, so no action follows. The `VICTORY_COPY_STAGES=1`
+breakdown has now been reported in `EXPERIMENT_LOG.md`: refresh flushes and
+their `nothing_new` checks dominate "copies", and the copy-back residual
+dominates "copying back". No optimisation has been chosen or written from it.
 
 Full results are in `EXPERIMENT_LOG.md`. The cache's win is mostly in the mean
 (4.5–7.8 ms) and p90 (2.8–7.4 ms); medians moved only 1–3 ms, so it mainly
@@ -163,23 +165,25 @@ Measured dense series-S frames spend 15.2 ms in copy recording and 10.5 ms in
 copy-back, versus 1.5 ms in the texture pass. Even perfect texture cuts cannot
 supply the ~18 ms needed for 30 fps, so the order is:
 
-1. **Copy recording** — the host's ~51 MB/frame is mostly refresh work on a
-   handful of large title buffers: a 50 MB buffer uploads ~7 MB/frame in ~160
-   pieces, two 24 MB buffers another ~4 MB, and a 45 MB buffer is fetched at
-   ~8 MB/frame. The bus actually moves ~13 MB up and ~13 MB back in ~50
-   copies. The dense log has ~7900 refresh spans per frame, ~6900 of them
-   known to copy nothing, so gather/schedule cost dominates bytes. Do not
-   simply place those big buffers in title memory: they sit above 4 GiB and
-   `port::place_for` only covers the low 4 GiB graphics region; moving them
-   would bring back PCIe-bound shader reads. Start at
-   `host.rs::run_deferred` and `host.rs::Batch`, preserving copied bytes and
-   every refresh's position relative to title and shader writes.
-2. **Copy-back** — investigate why ~9 MB/frame costs 10.5 ms and cut the CPU
-   side of that path without changing the read-back results.
-3. `VICTORY_HEAP_SYNC_EARLY` — clean dense A/B done: the current early default
-   was 47.55 ms mean / 45.9 ms median at 5,676 draws, against 49.5 ms / 48.0 ms
-   with early rounds off. The end wait did not fall (9.9 ms off vs 10.8 ms on),
-   so the mechanism is unconfirmed; no default change came from this run.
+1. **Copy recording** — stage timing (`VICTORY_COPY_STAGES=1`) split the
+   representative 13.47 ms "copies" into 10.46 ms refresh flushes, 2.18 ms
+   batch recording, 0.35 ms ask_ahead, 0.24 ms deferred fills and 0.00 ms
+   serial prefilters. Within the flushes, 6.86 ms was finding spans that copy
+   nothing, mostly on front workers (5.22 ms) and all-flush workers (1.57 ms).
+   Span gathering outside "copies" was 2.17 ms. Do not simply place the big
+   buffers in title memory: they sit above 4 GiB and `port::place_for` only
+   covers the low 4 GiB graphics region; moving them would bring back
+   PCIe-bound shader reads. Start at `host.rs::run_deferred` and
+   `host.rs::Batch`, preserving copied bytes and every refresh's position
+   relative to title and shader writes.
+2. **Copy-back** — stage timing split the 10.66 ms into 8.48 ms finding pieces,
+   scanning beside the fetch, merging and ranges, 1.27 ms waiting for the
+   fetch fence, and 0.90 ms recording/sending the fetch. Cut the residual,
+   not the fence wait, without changing read-back results.
+3. `VICTORY_HEAP_SYNC_EARLY` — A/B done: no regression, possible 1–2 ms,
+   mechanism unconfirmed. The run used the movement schedule and the two sides
+   saw different frames; only one pair was convincing. Early rounds are already
+   the default, so no action. Future A/Bs use Enter-only after world entry.
 4. Parked sub-ms texture cuts — not part of the 30 fps path.
 5. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.

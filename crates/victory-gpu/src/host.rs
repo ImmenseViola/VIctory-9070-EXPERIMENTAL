@@ -748,6 +748,13 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// The relay's split of the frame line's "copying back", in microseconds:
+/// waiting for a fetch's fence, recording and sending that fetch, and the
+/// residual (finding pieces, scanning beside the fetch, merging and ranges).
+/// The three parts add up to `COPY_BACK[0]` for every landing.
+#[cfg(feature = "diagnostics")]
+static COPY_BACK_PARTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -3571,6 +3578,14 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     blamed(why, us);
 }
 
+/// The parts of one relay fetch's time, for [`COPY_BACK_PARTS`]. Kept with the
+/// fetch so the split follows it from recording to landing.
+#[derive(Clone, Copy, Default)]
+struct CopyBackSplit {
+    wait_us: u64,
+    fetch_us: u64,
+}
+
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
@@ -3588,6 +3603,8 @@ struct RelayFetch {
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
     had: crate::land::Had,
+    /// The last fetch's split of the frame line's "copying back".
+    split: CopyBackSplit,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -4825,6 +4842,7 @@ impl Host {
                 buffer: None,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
+                split: CopyBackSplit::default(),
             })
         }
     }
@@ -4942,6 +4960,11 @@ impl Host {
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
         if pieces.is_empty() {
+            // Nothing to fetch, so this landing's split is all residual; a
+            // previous fetch's split must not be subtracted from it.
+            if let Some(f) = fetch.as_mut() {
+                f.split = CopyBackSplit::default();
+            }
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
             let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
@@ -4954,6 +4977,8 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
+        #[cfg(feature = "diagnostics")]
+        let mut split = CopyBackSplit::default();
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
@@ -4987,11 +5012,21 @@ impl Host {
                 if let Some(queue) = &copy_queue {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        split.fetch_us += waiting.elapsed().as_micros() as u64;
+                    }
                     meanwhile();
+                    #[cfg(feature = "diagnostics")]
+                    let wait_since = std::time::Instant::now();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        split.wait_us += wait_since.elapsed().as_micros() as u64;
+                    }
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -5002,11 +5037,21 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
+                #[cfg(feature = "diagnostics")]
+                {
+                    split.fetch_us += waiting.elapsed().as_micros() as u64;
+                }
                 meanwhile();
+                #[cfg(feature = "diagnostics")]
+                let wait_since = std::time::Instant::now();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                #[cfg(feature = "diagnostics")]
+                {
+                    split.wait_us += wait_since.elapsed().as_micros() as u64;
+                }
                 Ok(after)
             })()
         };
@@ -5015,6 +5060,10 @@ impl Host {
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
         let us = waiting.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        {
+            f.split = split;
+        }
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
@@ -5145,7 +5194,15 @@ impl Host {
                     }
                 }
                 crate::land::spent(crate::land::stat::DONE, finishing);
-                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let back_us = landing.elapsed().as_micros() as u64;
+                COPY_BACK[0].fetch_add(back_us, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let split = fetch.as_ref().map(|f| f.split).unwrap_or_default();
+                    COPY_BACK_PARTS[0].fetch_add(split.wait_us, Ordering::Relaxed);
+                    COPY_BACK_PARTS[1].fetch_add(split.fetch_us, Ordering::Relaxed);
+                    COPY_BACK_PARTS[2].fetch_add(back_us.saturating_sub(split.wait_us.saturating_add(split.fetch_us)), Ordering::Relaxed);
+                }
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
@@ -5820,6 +5877,8 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            #[cfg(feature = "diagnostics")]
+            let gather = std::time::Instant::now();
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -5834,6 +5893,8 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            #[cfg(feature = "diagnostics")]
+            note_copy_stage(COPY_SPAN_WALK, gather.elapsed().as_micros() as u64);
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -7695,7 +7756,10 @@ impl HostList {
             us += started.elapsed();
             bytes += copied as u64;
         }
-        PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
+        let us = us.as_micros() as u64;
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_copy_stage(COPY_RECORDING, us);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
@@ -7703,7 +7767,7 @@ impl HostList {
             add(C::CopyBytes, bytes);
             add(C::Refreshes, refreshes);
             add(C::RefreshBytes, refreshed);
-            SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
+            SPLIT[7].fetch_add(us * 1000, Ordering::Relaxed);
         }
     }
 }
@@ -7763,6 +7827,71 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Diagnostic stage breakdown of the frame line's "copies" (`PREPARING[0]`).
+/// These mirror the existing additions/subtractions to `PREPARING[0]`, so the
+/// stages plus the residual printed by [`copy_stage_line`] add up to that
+/// number. `KNOWN_WORKERS` and `REFRESH_CHECK` are nested inside `FLUSHES`,
+/// not added to the total again.
+#[cfg(feature = "diagnostics")]
+pub(crate) const COPY_SPAN_WALK: usize = 0;
+#[cfg(feature = "diagnostics")]
+pub(crate) const COPY_REFRESH_CHECK: usize = 1;
+#[cfg(feature = "diagnostics")]
+const COPY_PREFILTERS: usize = 2;
+#[cfg(feature = "diagnostics")]
+pub(crate) const COPY_KNOWN_WORKERS: usize = 3;
+#[cfg(feature = "diagnostics")]
+const COPY_FLUSHES: usize = 4;
+#[cfg(feature = "diagnostics")]
+const COPY_RECORDING: usize = 5;
+#[cfg(feature = "diagnostics")]
+const COPY_FILLS: usize = 6;
+#[cfg(feature = "diagnostics")]
+const COPY_ASK: usize = 7;
+
+/// Where a span was found to copy nothing: 0 the submitting thread's
+/// prefilter, 1 the front flush's workers, 2 the ahead flush's workers, 3 the
+/// all-flush's workers, 4 a flush before shader writes. The times overlap
+/// `COPY_PREFILTERS` / `COPY_KNOWN_WORKERS`; they are a further split.
+#[cfg(feature = "diagnostics")]
+static KNOWN_SITES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+static COPY_STAGES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Whether to time the individual `nothing_new` calls. Those calls are
+/// thousands a frame, so the default diagnostics build only times the blocks
+/// that already had a timer. `VICTORY_COPY_STAGES=1` turns the fine timing on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_STAGES").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_copy_stage(i: usize, us: u64) {
+    COPY_STAGES[i].fetch_add(us, Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sub_copy_stage(i: usize, us: u64) {
+    let _ = COPY_STAGES[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(us)));
+}
+
+/// A `nothing_new` decision, timed only when the fine breakdown is asked for.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn known_nothing(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, site: usize) -> bool {
+    if !copy_stages() {
+        return shadow.nothing_new(from, to - from);
+    }
+    let began = std::time::Instant::now();
+    let skip = shadow.nothing_new(from, to - from);
+    let us = began.elapsed().as_micros() as u64;
+    note_copy_stage(COPY_KNOWN_WORKERS, us);
+    KNOWN_SITES[site].fetch_add(us, Ordering::Relaxed);
+    skip
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -7782,6 +7911,59 @@ impl Split {
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
         SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The stages behind the frame line's "copies", per frame. The first five
+/// stages and `unattributed` add up to `copy_ms` up to sampling skew; the
+/// nested checks and the two outside stages are shown beside them.
+#[cfg(feature = "diagnostics")]
+fn copy_stage_line(frames: f64, copy_ms: f64) {
+    if !copy_stages() {
+        return;
+    }
+    let us: Vec<f64> = COPY_STAGES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames).collect();
+    let sites: Vec<f64> = KNOWN_SITES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames).collect();
+    let inside = us[COPY_RECORDING] + us[COPY_FLUSHES] + us[COPY_PREFILTERS] + us[COPY_FILLS] + us[COPY_ASK];
+    let unattributed = copy_ms - inside;
+    let submission = SPLIT[2].load(Ordering::Relaxed) as f64 / 1e6 / frames;
+    let known = sites.iter().sum::<f64>();
+    tracing::info!(
+        "copy recording stages per frame: {copy_ms:.2} ms = {recording:.2} batch recording + {flushes:.2} refresh flushes + \
+         {prefilters:.2} serial prefilters + {fills:.2} deferred fills + {ask:.2} ask_ahead + {unattributed:.2} unattributed; \
+         finding spans that copy nothing took {known:.2} ms (submit prefilter {s0:.2}, front workers {s1:.2}, \
+         ahead workers {s2:.2}, all workers {s3:.2}, before shader writes {s4:.2}, the last outside copies) and \
+         {check:.2} ms VICTORY_REFRESH_CHECK. \
+         Outside copies: {walk:.2} ms gathering/walking spans and {submission:.2} ms of the submission's steps (VICTORY_COPY_STAGES=1)",
+        recording = us[COPY_RECORDING],
+        flushes = us[COPY_FLUSHES],
+        prefilters = us[COPY_PREFILTERS],
+        fills = us[COPY_FILLS],
+        ask = us[COPY_ASK],
+        s0 = sites[0],
+        s1 = sites[1],
+        s2 = sites[2],
+        s3 = sites[3],
+        s4 = sites[4],
+        check = us[COPY_REFRESH_CHECK],
+        walk = us[COPY_SPAN_WALK],
+    );
+}
+
+/// The relay's split of the frame line's "copying back", per frame. Swapped
+/// beside `COPY_BACK[0]` so the parts belong to the same report interval.
+#[cfg(feature = "diagnostics")]
+fn copy_back_part_line(frames: f64, back_ms: f64) {
+    let p: Vec<f64> = COPY_BACK_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames).collect();
+    if p.iter().sum::<f64>() > 0.0 {
+        tracing::info!(
+            "of the frame line's copying back per frame: {:.2} ms waiting for a fetch's fence, {:.2} ms recording and \
+             sending the fetch copy, {:.2} ms finding/scanning/merging/ranges (the three add up to the frame line's {:.2} ms)",
+            p[0],
+            p[1],
+            p[2],
+            back_ms,
+        );
     }
 }
 
@@ -8364,7 +8546,11 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+        #[cfg(feature = "diagnostics")]
+        let known = crate::watch::light() && known_nothing(&shadow, from, to, 4);
+        #[cfg(not(feature = "diagnostics"))]
+        let known = crate::watch::light() && shadow.nothing_new(from, to - from);
+        if !known {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
@@ -8385,6 +8571,8 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_copy_stage(COPY_FLUSHES, us);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 
@@ -8405,6 +8593,8 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        #[cfg(feature = "diagnostics")]
+        let walk = std::time::Instant::now();
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
         // Renderer port #6: each list's part made on the threads beside, and
@@ -8443,6 +8633,8 @@ impl Batch {
                 }
             }
             let spans = join_fronts(&fronts, parts);
+            #[cfg(feature = "diagnostics")]
+            note_copy_stage(COPY_SPAN_WALK, walk.elapsed().as_micros() as u64);
             self.refresh_spans(spans, due, planning);
             return;
         }
@@ -8478,6 +8670,8 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        note_copy_stage(COPY_SPAN_WALK, walk.elapsed().as_micros() as u64);
         self.refresh_spans(spans, due, planning);
     }
 
@@ -8502,6 +8696,8 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
+        #[cfg(feature = "diagnostics")]
+        let (mut pre_us, mut ask_us) = (0u64, 0u64);
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
@@ -8511,15 +8707,29 @@ impl Batch {
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
+            let prefilter = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            {
+                pre_us = prefilter.elapsed().as_micros() as u64;
+                note_copy_stage(COPY_PREFILTERS, pre_us);
+                KNOWN_SITES[0].fetch_add(pre_us, Ordering::Relaxed);
+                FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            }
         }
         let ahead = spans.len() > 1;
         if ahead {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
+            #[cfg(feature = "diagnostics")]
+            {
+                ask_us += asking.elapsed().as_micros() as u64;
+                note_copy_stage(COPY_ASK, ask_us);
+            }
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
@@ -8530,7 +8740,11 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            #[cfg(feature = "diagnostics")]
+            let known = many && known_nothing(shadow, *from, *to, 1);
+            #[cfg(not(feature = "diagnostics"))]
+            let known = many && shadow.nothing_new(*from, *to - *from);
+            if known {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
@@ -8538,7 +8752,15 @@ impl Batch {
             Self::update(shadow, *from, *to);
         });
         if ahead {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
             crate::watch::ask_ahead_done();
+            #[cfg(feature = "diagnostics")]
+            {
+                let us = asking.elapsed().as_micros() as u64;
+                ask_us += us;
+                note_copy_stage(COPY_ASK, us);
+            }
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
@@ -8547,7 +8769,11 @@ impl Batch {
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        {
+            sub_copy_stage(COPY_FLUSHES, summed[0]);
+            note_copy_stage(COPY_FLUSHES, took.saturating_sub(pre_us).saturating_sub(ask_us));
+            SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
@@ -8581,17 +8807,25 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_copy_stage(COPY_SPAN_WALK, began.elapsed().as_micros() as u64);
         crate::shadow::wide_each(due.len(), move |i| {
             let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
+            #[cfg(feature = "diagnostics")]
+            let known = known_nothing(shadow, *from, *to, 2);
+            #[cfg(not(feature = "diagnostics"))]
+            let known = shadow.nothing_new(*from, *to - *from);
+            if !known {
                 Self::update(shadow, *from, *to);
             }
         });
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[0].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
+            sub_copy_stage(COPY_FLUSHES, summed.saturating_sub(wall));
             let ns = began.elapsed().as_nanos() as u64;
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
@@ -8620,9 +8854,13 @@ impl Batch {
             });
         }
         let took = started.elapsed();
-        PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        let us = took.as_micros() as u64;
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        {
+            note_copy_stage(COPY_FILLS, us);
+            SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// The textures due are brought up to date.
@@ -8673,9 +8911,14 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            {
+                note_copy_stage(COPY_PREFILTERS, us);
+                KNOWN_SITES[0].fetch_add(us, Ordering::Relaxed);
+                FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            }
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8689,7 +8932,10 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            note_copy_stage(COPY_ASK, us);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -8704,7 +8950,11 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    let known = (refreshes.len() > FEW || beside) && known_nothing(shadow, *from, *to, 3);
+                    #[cfg(not(feature = "diagnostics"))]
+                    let known = (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from);
+                    if known {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
@@ -8720,7 +8970,10 @@ impl Batch {
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            let wall = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            sub_copy_stage(COPY_FLUSHES, summed.saturating_sub(wall));
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -9288,6 +9541,10 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
+            #[cfg(feature = "diagnostics")]
+            copy_stage_line(frames, copy_ms);
+            #[cfg(feature = "diagnostics")]
+            copy_back_part_line(frames, back_ms);
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
