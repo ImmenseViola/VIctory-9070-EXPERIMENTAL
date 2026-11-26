@@ -116,3 +116,6 @@ roughly 18 ms of the dense mean has to go.
 - Full heap-texture aside only after the ahead-job refactor is safe.
 - Memory wall (~30 GB private) and dense driving dips remain separate
   stability problems; no switch here claims to solve them.
+- Vegetation distance fade is suspected by the user to be a RAM/streaming
+  ceiling rather than ordinary LOD. Parked by request until the multi-ms CPU
+  work is done; no change has been made for it.
