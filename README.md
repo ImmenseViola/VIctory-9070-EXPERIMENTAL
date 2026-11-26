@@ -1,5 +1,12 @@
 # VIctory for Radeon RX 9070 (RDNA4)
 
+> ## ⚠️ EXPERIMENTAL FORK
+> This is **not** the tuned main tree. It exists to carry risky performance
+> experiments away from `ImmenseViola/VIctory-9070`. Experimental switches may
+> be on by default here, may change behaviour, and may be reverted. Read
+> [EXPERIMENT.md](EXPERIMENT.md) and [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md)
+> before using it. Nothing here is a release.
+
 A tuned fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
 supplies. It starts from the tuned
@@ -26,6 +33,12 @@ comes after the frame rate: foliage flicker, black glass, and texture pop-in
 are still open.
 
 ## Where it stands (2026-11-26)
+
+Everything below is inherited from the tuned tree. The only thing this fork
+changes today is the texture-view cache described in
+[EXPERIMENT.md](EXPERIMENT.md); the measured A/B result is in
+[EXPERIMENT_LOG.md](EXPERIMENT_LOG.md). Nothing here has been promoted back to
+`ImmenseViola/VIctory-9070`.
 
 ### RX 9070 / RDNA4 release check
 
@@ -156,8 +169,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/ImmenseViola/VIctory-9070.git
-cd VIctory-9070
+git clone https://github.com/ImmenseViola/VIctory-9070-EXPERIMENTAL.git
+cd VIctory-9070-EXPERIMENTAL
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
@@ -237,6 +250,29 @@ experimenting: `VICTORY_SEND_CHANGED=1`, `VICTORY_BVH_BUILDER=1`,
 the tuned configuration. `VICTORY_SHADER_SAVE`, `VICTORY_EMIT_DUMP`, and
 `VICTORY_SHADER_FRESH=1` only write or compare data and are safe when you have
 the disk space.
+
+## Experimental switches in this fork
+
+These are **not** in the tuned tree. Defaults below are for
+`experimental/texture-pass-aside`; both branches of this repo carry them, and
+the tuned `ImmenseViola/VIctory-9070` tree carries neither.
+
+| Switch | Default here | What it does | Status |
+|---|---|---|---|
+| `VICTORY_TEX_VIEW_CACHE` | **on** | Reads each texture slot's heap handle and raw view once, instead of on every look in that slot | Clean dense A/B win (4.5-7.8 ms mean, 2.8-7.4 ms p90); pending user visual check |
+| `VICTORY_TEX_SKIP_NOVIEW` | off | Early-finishes due slots whose view can never name a host texture | Built and tested; no game A/B yet |
+
+To get the tuned behaviour, launch with `VICTORY_TEX_VIEW_CACHE=0`. For a
+one-run comparison use `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`; a switch named
+in `VICTORY_AB` no longer reads its own environment value. The cache changes
+only when a raw descriptor view is read; no upload, barrier, refresh, command
+order, or texture lifetime moves. The risk is that the title can write a
+descriptor while the pass runs, so a cached view can be slightly older than a
+fresh read. That is why it is still an experiment.
+
+Full protocol, results, and the next planned cuts:
+[EXPERIMENT.md](EXPERIMENT.md) and [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md).
+The local launch/monitor scripts are in [tools/](tools/README.md).
 
 ## What is different here
 

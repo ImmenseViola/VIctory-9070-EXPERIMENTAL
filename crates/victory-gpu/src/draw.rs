@@ -208,10 +208,11 @@ fn recheck_soon() -> bool {
 
 /// Whether the pass that uploads textures picked by index reads a slot's heap
 /// handle and raw descriptor view once, rather than on every look at that
-/// slot (`VICTORY_TEX_VIEW_CACHE=1`; off by default; A/B-able with
-/// `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE`). The title can write a descriptor
-/// while the pass runs, so a cached view is deliberately an experiment and is
-/// kept away from the tuned tree.
+/// slot. On by default in this experimental branch; `VICTORY_TEX_VIEW_CACHE=0`
+/// restores the tuned tree's read-every-time behaviour. A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE`. The title can write a descriptor
+/// while the pass runs, so a cached view is still kept away from the tuned
+/// tree until the user's visual check.
 fn tex_view_cache() -> bool {
     // `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE` compares the cache against
     // reading the descriptor each time in one run.
@@ -220,7 +221,7 @@ fn tex_view_cache() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_none_or(|v| v != "0"))
 }
 
 /// Whether the texture pass gives up on a due slot whose raw view can never

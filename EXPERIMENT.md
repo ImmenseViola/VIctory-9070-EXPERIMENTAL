@@ -1,77 +1,92 @@
-# VIctory-9070 EXPERIMENTAL
+# VIctory-9070 — EXPERIMENTAL
 
-Isolated home for risky texture-pass work. The tuned tree in
-`VIctory-7900XTX` and its `main` branch are deliberately untouched.
+> **EXPERIMENTAL FORK. NOT THE TUNED MAIN TREE.**
+> The tuned tree in `VIctory-7900XTX` and its `main` branch are untouched.
+> Nothing here is a release. Do not merge back until the user has visual-tested
+> a full-length visible run and approved it.
 
 - Repo: <https://github.com/ImmenseViola/VIctory-9070-EXPERIMENTAL>
-- Branch: `experimental/texture-pass-aside`
-- Baseline: current tuned tree, commit `5d784e3`
-- Switch commit: `0d2ccb0`
+- Working branch: `experimental/texture-pass-aside`
+- GitHub root: `main` is mirrored from the working branch so the repo is not
+  empty; `experimental/texture-pass-aside` is where work lands first.
+- Baseline: the tuned tree as of `5d784e3`.
 
-## Goal
+## Why this exists
 
-The distant view in the tuned build is host-bound, not VRAM-bandwidth-bound:
-the card is only ~55–61% busy and sits idle while the submitting thread
-prepares descriptor/refreshes/copies. The heap-texture pass is one of the
-remaining inline costs (roughly 7–10 ms in dense views). The long-term idea
-is to move that pass aside; the immediate experiment is to remove only work
-that is provably read-side.
+The tuned build is host-bound in dense views, not VRAM-bandwidth-bound. The
+card is only ~55–61% busy and sits idle while the submitting thread prepares
+descriptor/refreshes/copies. The heap-texture pass is one of the remaining
+inline costs (roughly 7–10 ms in dense views).
 
-## `VICTORY_TEX_VIEW_CACHE`
+The eventual goal is moving that work aside. A direct
+`aside::begin(heap_textures)` move is **unsafe**: `State::heap_textures`
+records D3D commands into the title's list and needs a much larger ahead-job
+refactor. So this fork tests small, read-side cuts first, one switch at a time,
+without touching the tuned tree.
 
-Off by default. Enable for one run with:
+## Current default
 
-```powershell
-$env:VICTORY_TEX_VIEW_CACHE='1'
-```
+`VICTORY_TEX_VIEW_CACHE` is **enabled by default in this fork**. This is
+intentional: the fork exists to carry the experiment. Set
+`VICTORY_TEX_VIEW_CACHE=0` to restore the tuned tree's read-every-time
+behaviour, or use `VICTORY_AB` to compare both sides in one run.
 
-or compare in one run with:
+## Switches
 
-```powershell
-$env:VICTORY_AB='20,VICTORY_TEX_VIEW_CACHE'
-```
+| Switch | Default here | A/B name | Status |
+|---|---|---|---|
+| `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win; pending user visual check |
+| `VICTORY_TEX_SKIP_NOVIEW` | off | `VICTORY_TEX_SKIP_NOVIEW` | Built and tested; no game A/B yet |
 
-A switch named in `VICTORY_AB` no longer follows its own environment value.
+A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
+environment value; the A/B phases decide it.
 
-### What it changes
+### `VICTORY_TEX_VIEW_CACHE`
 
-In `crates/victory-gpu/src/draw.rs`, `State::heap_textures` currently reads
-the same descriptor many times for one due slot:
+In `crates/victory-gpu/src/draw.rs`, `State::heap_textures` used to read the
+same descriptor many times for one due slot — `heap.handle(index)` up to ten
+times and `heap.handle(index).and_then(descriptor::view)` several more. With
+this switch, each due slot lazily caches one handle and one raw view, then
+reuses them for the rest of that slot.
 
-- `heap.handle(index)` up to ten times,
-- `heap.handle(index).and_then(descriptor::view)` several times.
+Unchanged:
 
-With the switch on, each due slot lazily caches:
+- `host.mirror`, `texture_slot_*`, `ahead::take/send`, and `readable` are still
+  called at the same points and in the same order.
+- No upload, barrier, refresh, or command-list ordering moves.
+- No texture selection, budget, or lifetime change.
 
-- one `Option<u64>` handle, and
-- one `Option<View>` raw descriptor view,
+Risk: the title can write a descriptor while the texture pass runs, so a
+cached raw view can be slightly older than a fresh read later in the same
+slot. That is the only semantic change. It stays out of the tuned tree until
+the user says the picture is clean.
 
-then reuses them for the rest of that slot. `host.mirror`, `texture_slot_*`,
-`ahead::take/send`, `readable`, and every deferred step are still called at
-the same points and in the same order. With the switch off the old reads are
-performed exactly where they were before.
+### `VICTORY_TEX_SKIP_NOVIEW`
 
-### Why it is experimental
+Off here too until it earns a place. After the room and residency gates, a due
+slot whose raw view is a constant, sampler, console sampler, unordered view, or
+unordered placed view is finished immediately instead of being mirrored and
+then discarded a few lines later. Placed buffers and shader-resource views are
+left on the old path because their mapped/title-written state may still
+matter.
 
-The title can write a descriptor while the texture pass is running. The
-cached raw view can therefore be slightly older than a fresh read later in
-the same slot. That is the only semantic change; it is deliberately kept out
-of the tuned tree until game A/B and visual checks say otherwise.
+This is also read-side/early-exit only. It is built into
+`target-exp2\diag\victory.exe`; `target-exp\diag\victory.exe` remains the
+view-cache-only binary for the user's visual test.
 
-### What it does not do
+## Game A/B protocol
 
-- It does not move D3D recording off the submitting thread.
-- It does not reorder uploads, barriers, refreshes, or host writes.
-- It does not change texture selection, budgets, or slot lifetimes.
+- warmed cache `victory-7900-clean-cache-1`
+- `VICTORY_LATE_WAIT=3`
+- `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`
+- passive screen/motion/memory monitor
+- watcher stops at phase 7 or 29.5 GB private and refuses to kill during
+  shader/pipeline creation
+- no manual input during automated runs
 
-A full `aside::begin` offload of `heap_textures` is **not** safe: that
-function records commands into the title's list and needs a much larger
-ahead-job refactor. See `PERF_GOAL.md` in the parent temp folder for the
-mapping.
+Full results are in `EXPERIMENT_LOG.md`.
 
-## Validation
-
-Build and tests:
+## Build and run
 
 ```powershell
 cd 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-9070-EXPERIMENTAL'
@@ -80,53 +95,39 @@ cargo test -p victory-gpu --features diagnostics
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
-Last build: 434 unit tests + replay tests passed; binary at
-`target-exp\diag\victory.exe`.
+Quick start for user test play (view cache on by default, no input script):
 
-Game A/B protocol:
+```powershell
+& 'C:\Users\Admin\AppData\Local\Temp\opencode\start-play-session.ps1' `
+  -Tag texview-visual1 `
+  -Binary 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-9070-EXPERIMENTAL\target-exp\diag\victory.exe' `
+  -Console series-x -Upscaler 6 `
+  -Cache 'C:\Users\Admin\AppData\Local\Temp\opencode\victory-7900-clean-cache-1' `
+  -Extra @{ VICTORY_CARD_BUFFERS_MIN_MB='1'; VICTORY_LATE_WAIT='3'; VICTORY_KEYS='' }
+```
 
-- warmed cache `victory-7900-clean-cache-1`,
-- `VICTORY_LATE_WAIT=3`,
-- `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`,
-- passive screen/motion/memory monitor,
-- watcher stops at phase 7 or 29.5 GB private and refuses to kill during
-  shader/pipeline creation,
-- no manual input during the automated run.
+Local harness scripts used for these runs are copied into `tools/`; their
+paths are machine-specific and meant to be edited.
 
-### Results
+## Promotion rule
 
-| Run | Outcome |
-|---|---|
-| `texview-ab1` | Clean cycle, but world entry and camera/draw swings confounded phases 4–7. Only matched pair: 33.4 ms on vs 37.9 ms off at 6–8 draws. Suggests a win; not enough to promote. |
-| `texview-ab2` | Clean matched dense pairs at ~5.83k draws. Phase 4 off 70.9 ms mean / 53.0 median / 94.3 p90 vs phase 5 on 63.1 / 52.0 / 88.6. Phase 6 off 64.3 / 51.0 / 89.6 vs phase 7 on 59.8 / 48.2 / 82.2. About 4.5–7.8 ms mean and 2.8–7.4 ms p90 better with the cache. Frames stayed 96.7% non-black; private 25.8 GB at stop. |
+Nothing here goes into the tuned tree until there is:
 
-Promotion requires a clean dense matched A/B, stable memory, and a visual
-check by the user. Nothing is promoted to the tuned tree until then.
+1. a clean dense matched A/B,
+2. stable memory with no paging-crash frames, and
+3. a user visual check for shimmer, flicker, missing textures, wrong floor
+   colours, and face/eye artifacts.
 
-## `VICTORY_TEX_SKIP_NOVIEW`
-
-Also off by default and A/B-able with `VICTORY_AB=<s>,VICTORY_TEX_SKIP_NOVIEW`.
-Added in commit `3da9305`. After the room and residency gates, a due slot whose
-raw view is a constant, sampler, console sampler, unordered view, or an
-unordered placed view is finished immediately instead of being mirrored and
-then discarded a few lines later. Placed buffers and shader-resource views are
-left on the old path because their mapped/title-written state may still matter.
-
-This is read-side/early-exit only: no upload, barrier, refresh, or lifetime is
-moved. Build and tests are green (434 unit tests + replay tests). It is built
-into `target-exp2\diag\victory.exe`, leaving the `target-exp` binary from the
-view-cache A/B untouched for user test play.
-
-No game A/B has been run for this switch yet.
+The view cache has satisfied (1) and (2). It is waiting on (3).
 
 ## Next cuts, in order
 
 1. `VICTORY_TEX_HOST_CACHE` — avoid a repeated `GetDesc`/`hosted()` and a
-   second `placed_texture` per candidate. Expected 0.2–1 ms; low-medium
-   risk.
+   second `placed_texture` per candidate. Expected 0.2–1 ms.
 2. `VICTORY_TEX_QUEUE_BATCH` — coalesce host-slot mutex updates. Expected
-   0.2–1.5 ms in backlog-heavy passes; medium risk because `room` checks
-   must stay in the same places.
+   0.2–1.5 ms in backlog-heavy passes; `room` checks must stay in place.
+3. Full heap-texture aside — only after an ahead-job refactor that can carry
+   texture uploads and barriers safely.
 
-Parallel filtering of live descriptor/title state is deliberately parked;
-it would change which bytes upload.
+Parallel filtering of live descriptor/title state is parked; it would change
+which bytes upload.
