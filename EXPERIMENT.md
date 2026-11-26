@@ -165,9 +165,14 @@ Measured dense series-S frames spend 15.2 ms in copy recording and 10.5 ms in
 copy-back, versus 1.5 ms in the texture pass. Even perfect texture cuts cannot
 supply the ~18 ms needed for 30 fps, so the order is:
 
-1. **Copy recording** — find repeated work and batching opportunities in the
-   ~51 MB/frame copy path; target several milliseconds, preserving which bytes
-   upload and command order.
+1. **Copy categories** — the host's ~51 MB/frame is mostly refresh work on a
+   handful of large title buffers: a 50 MB buffer uploads ~7 MB/frame in ~160
+   pieces, two 24 MB buffers another ~4 MB, and a 45 MB buffer is fetched at
+   ~8 MB/frame. The bus actually moves ~13 MB up and ~13 MB back in ~50
+   copies. Map those addresses to title heaps and test whether
+   `port::place_for` can place any of them like renderer port 1 does for the
+   32-bit graphics heap — stopping a whole category is worth more than
+   shaving the remaining calls.
 2. **Copy-back** — investigate why ~9 MB/frame costs 10.5 ms and cut the CPU
    side of that path without changing the read-back results.
 3. `VICTORY_TEX_SKIP_NOVIEW` — only after the mirror-safety trace says it is

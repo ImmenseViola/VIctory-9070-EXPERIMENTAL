@@ -108,11 +108,45 @@ wait. Mean 5.7k draws. Private memory reached 29.7 GB at the stop, with no
 shader/pipeline work active. The frame is still host-bound: to reach 30 fps,
 roughly 18 ms of the dense mean has to go.
 
+### Copy composition — what the 51 MB/frame actually is
+
+The `copystat` "largest ranges" lines count whole refresh spans, not bytes
+moved: the top ten spans add up to ~500 MB/frame while the bus-traffic counter
+reports only ~13 MB up and ~13 MB fetched in about 50 copies. `shadow::update`
+copies only changed pieces via `watch::writes`, so the large spans are checked,
+not sent. The host log's 15.2 ms / 50.9 MB "copies" includes the whole refresh
+path, of which bus traffic is a smaller part.
+
+Busy title buffers over the bus (peak / average MB up per frame, pieces):
+
+| Buffer (title address + length) | Size | Up | Fetched | What it is |
+|---|---|---|---|---|
+| `0xac6160000+0x3200000` | 50 MB (mapped) | 9.6 / 7.0 MB, ~160 pieces | 3.3 MB | large title buffer, host copy on card |
+| `0xaf5b70000+0x1800000` | 24 MB (mapped) | 5.4 / 2.5 MB, ~118 pieces | 0.3 MB | large title buffer, host copy on card |
+| `0xaee5f0000+0x1800000` | 24 MB (mapped) | 2.4 / 1.7 MB, ~45 pieces | ~0 | large title buffer, host copy on card |
+| `0xaec460000+0x5a42d2` | 5.7 MB (private) | 2.3 / 1.9 MB, ~64 pieces | ~0 | title buffer, host copy on card |
+| `0x962440000+0x2d00000` | 45 MB (private) | ~0 / 0.01 MB | 8.1 MB, ~720 pieces | fetch-heavy, almost no upload |
+| `0xaf4e70000+0xc00000` | 12 MB (mapped) | 0.7 / 0.4 MB | 5.3 MB, ~38 pieces | mixed |
+
+`shadow.rs:5270-5297` names these `title buffer <address>` and logs the large
+ones as `large buffer copied to the host`; `host::traffic` is the source of the
+bus numbers. Their writers are the title's CPU (page-fault/guard write
+tracking) and shader UAV writes (`shadow.rs` pending ranges), not our texture
+uploads. The logs do not name a higher-level owner such as "constants" or
+"skinning"; that mapping still has to be established before a port.
+
+This is why the next big win is likely another renderer port that stops a
+whole category of these copies (as ports 5 and 6 did), not shaving work off
+the remaining 50 calls.
+
 ## Open work
 
 - Find a multi-millisecond CPU cut: copy recording (15.2 ms) and copy-back
   (10.5 ms) are the two largest measured pieces; the texture pass is only
-  1.5 ms now. Sub-ms texture cuts cannot reach 30 fps.
+  1.5 ms now. Bus-traffic composition is above; the next step is to map the
+  six busy buffers to title heaps and test whether `port::place_for` can place
+  any of them in place instead of copying. Sub-ms texture cuts cannot reach
+  30 fps.
 - Draw-time mirror-safety trace for `VICTORY_TEX_SKIP_NOVIEW`. It skips
   `host.mirror` bookkeeping, so the game A/B is blocked until every binding
   path for those view kinds is shown to mirror first.
