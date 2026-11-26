@@ -755,6 +755,26 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 #[cfg(feature = "diagnostics")]
 static COPY_BACK_PARTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// With [`copy_stages`]: microseconds the thread that submits waited on the
+/// relay: 0 inside a submission (already part of the `SPLIT` segment it
+/// happened in), 1 outside submissions (present/fence settles), then the
+/// same waits in each place by the reason that settled them.
+#[cfg(feature = "diagnostics")]
+static SUBMIT_RELAY_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
+static SUBMIT_RELAY_WHY: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
+
+// Which threads have prepared a submission (the title submits on more than
+// one), and whether this thread is in one now. The first lets waits at
+// presents and fences be attributed to a submitting thread too; the second
+// keeps waits inside a submission nested, not added again to its wall-clock
+// split.
+#[cfg(feature = "diagnostics")]
+std::thread_local! {
+    static SUBMITTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IN_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -3575,7 +3595,15 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
-    blamed(why, us);
+    {
+        let on_submit_thread = SUBMITTER.with(|submitter| submitter.get());
+        if on_submit_thread {
+            let inside = usize::from(IN_SUBMIT.with(|inside| inside.get()));
+            SUBMIT_RELAY_US[inside].fetch_add(us, Ordering::Relaxed);
+            SUBMIT_RELAY_WHY[inside * 11 + why.min(10)].fetch_add(us, Ordering::Relaxed);
+        }
+        blamed(why, us);
+    }
 }
 
 /// The parts of one relay fetch's time, for [`COPY_BACK_PARTS`]. Kept with the
@@ -5769,6 +5797,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
+        let _in_submit = InSubmit::enter();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -7859,6 +7889,28 @@ static KNOWN_SITES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 #[cfg(feature = "diagnostics")]
 static COPY_STAGES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// Wall split of the parallel workers in refresh flushes: the sum of their
+/// wall time, the part queueing them, the time the submitting thread spent
+/// running a job, the workers' CPU time summed, the slowest worker in each
+/// flush, the number of workers, and the CPU time in `Shadow::update` (a
+/// nested, not additive, part of the workers' time).
+#[cfg(feature = "diagnostics")]
+pub(crate) const FLUSH_WIDE_WALL: usize = 0;
+#[cfg(feature = "diagnostics")]
+const FLUSH_WIDE_DISPATCH: usize = 1;
+#[cfg(feature = "diagnostics")]
+const FLUSH_WIDE_CALLER: usize = 2;
+#[cfg(feature = "diagnostics")]
+const FLUSH_WORKER_BUSY: usize = 3;
+#[cfg(feature = "diagnostics")]
+const FLUSH_WORKER_SLOWEST: usize = 4;
+#[cfg(feature = "diagnostics")]
+const FLUSH_WORKER_COUNT: usize = 5;
+#[cfg(feature = "diagnostics")]
+static FLUSH_TIMING: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+#[cfg(feature = "diagnostics")]
+static FLUSH_COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether to time the individual `nothing_new` calls. Those calls are
 /// thousands a frame, so the default diagnostics build only times the blocks
 /// that already had a timer. `VICTORY_COPY_STAGES=1` turns the fine timing on.
@@ -7878,6 +7930,27 @@ pub(crate) fn sub_copy_stage(i: usize, us: u64) {
     let _ = COPY_STAGES[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(us)));
 }
 
+/// The wide workers of a refresh flush, timed only for the fine breakdown.
+#[cfg(feature = "diagnostics")]
+fn flush_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if copy_stages() {
+        let timed = crate::shadow::wide_each_timed(n, work);
+        FLUSH_TIMING[FLUSH_WIDE_WALL].fetch_add(timed.wall_ns, Ordering::Relaxed);
+        FLUSH_TIMING[FLUSH_WIDE_DISPATCH].fetch_add(timed.dispatch_ns, Ordering::Relaxed);
+        FLUSH_TIMING[FLUSH_WIDE_CALLER].fetch_add(timed.caller_busy_ns, Ordering::Relaxed);
+        FLUSH_TIMING[FLUSH_WORKER_BUSY].fetch_add(timed.busy_ns.iter().copied().sum(), Ordering::Relaxed);
+        FLUSH_TIMING[FLUSH_WORKER_SLOWEST].fetch_add(timed.busy_ns.iter().copied().max().unwrap_or(0), Ordering::Relaxed);
+        FLUSH_TIMING[FLUSH_WORKER_COUNT].fetch_add(timed.busy_ns.len() as u64, Ordering::Relaxed);
+    } else {
+        crate::shadow::wide_each(n, work);
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn flush_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    crate::shadow::wide_each(n, work);
+}
+
 /// A `nothing_new` decision, timed only when the fine breakdown is asked for.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn known_nothing(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, site: usize) -> bool {
@@ -7895,6 +7968,26 @@ pub(crate) fn known_nothing(shadow: &std::sync::Arc<crate::shadow::Shadow>, from
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
+
+/// Marks the submitting thread for the time a submission is being prepared,
+/// so waits on the relay inside it are not counted twice in the wall split.
+#[cfg(feature = "diagnostics")]
+struct InSubmit(bool);
+
+#[cfg(feature = "diagnostics")]
+impl InSubmit {
+    fn enter() -> Self {
+        SUBMITTER.with(|submitter| submitter.set(true));
+        Self(IN_SUBMIT.with(|inside| inside.replace(true)))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for InSubmit {
+    fn drop(&mut self) {
+        IN_SUBMIT.with(|inside| inside.set(self.0));
+    }
+}
 
 #[cfg(feature = "diagnostics")]
 impl Split {
@@ -7948,6 +8041,7 @@ fn copy_stage_line(frames: f64, copy_ms: f64) {
         check = us[COPY_REFRESH_CHECK],
         walk = us[COPY_SPAN_WALK],
     );
+    refresh_flush_line(frames, us[COPY_FLUSHES]);
 }
 
 /// The relay's split of the frame line's "copying back", per frame. Swapped
@@ -7965,6 +8059,101 @@ fn copy_back_part_line(frames: f64, back_ms: f64) {
             back_ms,
         );
     }
+}
+
+/// A wall-clock account of the frame from the submitting thread's side. The
+/// eleven [`SPLIT`] segments below are the whole of each submission, end to
+/// end; the span walk and copies/fills are nested inside them, not added
+/// again. Relay waits inside a submission are nested in the segment they
+/// happened in; waits outside one are added once. Pipeline waits are counted
+/// on all threads and so are shown beside, not subtracted from, the frame.
+#[cfg(feature = "diagnostics")]
+fn critical_line(frames: f64, ms: f64) {
+    if !copy_stages() {
+        return;
+    }
+    let p: Vec<f64> = [11usize, 12, 13, 14, 0, 1, 2, 3, 4, 15, 5]
+        .map(|i| SPLIT[i].load(Ordering::Relaxed) as f64 / 1e6 / frames)
+        .to_vec();
+    let walk = SPLIT[8].load(Ordering::Relaxed) as f64 / 1e6 / frames;
+    let refresh = SPLIT[6].load(Ordering::Relaxed) as f64 / 1e6 / frames;
+    let copies_fills = SPLIT[7].load(Ordering::Relaxed) as f64 / 1e6 / frames;
+    let submit = p.iter().sum::<f64>();
+    let relay: Vec<f64> = SUBMIT_RELAY_US.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames).collect();
+    let why: Vec<f64> = SUBMIT_RELAY_WHY.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames).collect();
+    let (inside, outside) = (why[..11].to_vec(), why[11..].to_vec());
+    let pipeline = crate::copystat::peek(crate::copystat::C::PipelineWaitUs) as f64 / 1e3 / frames;
+    let other = (ms - submit - relay[1]).max(0.0);
+    tracing::info!(
+        "critical path per frame (VICTORY_COPY_STAGES=1): {ms:.2} ms = {submit:.2} ms in submissions (lock {lock:.2}, card \
+         steps {steps:.2}, flight waits {flights:.2}, sweep/gather {gather:.2}, asking {ask:.2}, bytes under flights {bytes:.2}, \
+         lists' steps {lists:.2}, snapshots {snaps:.2}, card copies {card:.2}, heap waits {heaps:.2}, sending {send:.2}), \
+         {outside:.2} ms waiting outside submissions for the relay, {other:.2} ms title work/elsewhere. Nested in those: \
+         {walk:.2} ms walking spans inside asking, {refresh:.2} ms refreshes and {copies_fills:.2} ms copies/fills inside the \
+         lists' steps (they overlap), and {inside:.2} ms of relay waits inside a submission (present {present:.2}, value \
+         {value:.2}, stale {stale:.2}, read \
+         {read:.2}, step {run:.2}, most {most:.2}, fence {fence:.2}). Outside relay waits by reason: \
+         {outside_present:.2}/{outside_value:.2}/{outside_stale:.2}/{outside_read:.2}/{outside_run:.2}/{outside_most:.2}/\
+         {outside_fence:.2} ms. Pipeline waits on all threads were {pipeline:.2} ms (often nested in the lists' steps)",
+        lock = p[0],
+        steps = p[1],
+        flights = p[2],
+        gather = p[3],
+        ask = p[4],
+        bytes = p[5],
+        lists = p[6],
+        snaps = p[7],
+        card = p[8],
+        heaps = p[9],
+        send = p[10],
+        inside = relay[0],
+        outside = relay[1],
+        present = inside[WHY_SYNC],
+        value = inside[WHY_VALUE],
+        stale = inside[WHY_STALE],
+        read = inside[WHY_READ],
+        run = inside[WHY_RUN],
+        most = inside[WHY_MOST],
+        fence = inside[WHY_FENCE],
+        outside_present = outside[WHY_SYNC],
+        outside_value = outside[WHY_VALUE],
+        outside_stale = outside[WHY_STALE],
+        outside_read = outside[WHY_READ],
+        outside_run = outside[WHY_RUN],
+        outside_most = outside[WHY_MOST],
+        outside_fence = outside[WHY_FENCE],
+    );
+}
+
+/// The wall cost of the wide workers in refreshes, beside [`copy_stage_line`].
+#[cfg(feature = "diagnostics")]
+fn refresh_flush_line(frames: f64, stage_ms: f64) {
+    let raw: Vec<u64> = FLUSH_TIMING.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+    let t: Vec<f64> = raw.iter().map(|&n| n as f64 / 1e6 / frames).collect();
+    let copies = FLUSH_COPY_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+    if raw[FLUSH_WIDE_WALL] == 0 && copies == 0.0 {
+        return;
+    }
+    let join = (t[FLUSH_WIDE_WALL] - t[FLUSH_WIDE_DISPATCH] - t[FLUSH_WIDE_CALLER]).max(0.0);
+    let flushes = FLUSHES[0].load(Ordering::Relaxed) as f64 / frames;
+    let workers = raw[FLUSH_WORKER_COUNT] as f64 / frames;
+    let avg = if workers > 0.0 { t[FLUSH_WORKER_BUSY] / workers } else { 0.0 };
+    let slowest = if flushes > 0.0 { t[FLUSH_WORKER_SLOWEST] / flushes } else { 0.0 };
+    tracing::info!(
+        "refresh flush workers per frame: {stage_ms:.2} ms stage; the parallel part's {wall:.2} ms = {dispatch:.2} ms \
+         dispatch/queueing + {caller:.2} ms work on the submitting thread + {join:.2} ms join/wait; the workers' summed CPU \
+         was {busy:.2} ms ({avg:.2} ms for the average worker, slowest worker {slowest:.2} ms in each of {flushes:.0} \
+         flushes, {count:.0} workers); actual shadow updates were {copies:.2} ms of that CPU (VICTORY_COPY_STAGES=1)",
+        wall = t[FLUSH_WIDE_WALL],
+        dispatch = t[FLUSH_WIDE_DISPATCH],
+        caller = t[FLUSH_WIDE_CALLER],
+        busy = t[FLUSH_WORKER_BUSY],
+        avg = avg,
+        slowest = slowest,
+        flushes = flushes,
+        count = workers,
+        copies = copies,
+    );
 }
 
 /// The split of the preparing, per frame, for the frame-rate line.
@@ -8572,7 +8761,12 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        note_copy_stage(COPY_FLUSHES, us);
+        {
+            if copy_stages() {
+                FLUSH_COPY_US.fetch_add(us, Ordering::Relaxed);
+            }
+            note_copy_stage(COPY_FLUSHES, us);
+        }
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 
@@ -8733,7 +8927,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        flush_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
@@ -8809,7 +9003,7 @@ impl Batch {
         let before = PREPARING[0].load(Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         note_copy_stage(COPY_SPAN_WALK, began.elapsed().as_micros() as u64);
-        crate::shadow::wide_each(due.len(), move |i| {
+        flush_each(due.len(), move |i| {
             let (shadow, from, to) = &due[i];
             #[cfg(feature = "diagnostics")]
             let known = known_nothing(shadow, *from, *to, 2);
@@ -8948,7 +9142,7 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
+                flush_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     #[cfg(feature = "diagnostics")]
                     let known = (refreshes.len() > FEW || beside) && known_nothing(shadow, *from, *to, 3);
@@ -9542,9 +9736,13 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             #[cfg(feature = "diagnostics")]
+            critical_line(frames, ms);
+            #[cfg(feature = "diagnostics")]
             copy_stage_line(frames, copy_ms);
             #[cfg(feature = "diagnostics")]
             copy_back_part_line(frames, back_ms);
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::find_line(frames);
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);

@@ -1606,6 +1606,113 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     wide(jobs);
 }
 
+/// A diagnostic copy of [`wide`]'s timing: how long it took to queue the
+/// jobs, the wall time, and the time the calling thread spent running a job.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct WideTiming {
+    dispatch_ns: AtomicU64,
+    wall_ns: AtomicU64,
+    caller_busy_ns: AtomicU64,
+}
+
+/// What one [`wide_each`] call's workers did, for [`crate::host`]'s flush
+/// breakdown. `busy_ns` is one worker's time each, not a wall time.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct WideEachTiming {
+    pub(crate) dispatch_ns: u64,
+    pub(crate) wall_ns: u64,
+    pub(crate) caller_busy_ns: u64,
+    pub(crate) busy_ns: Vec<u64>,
+}
+
+/// [`wide`] with the same queue and wait, timed only for the breakdown.
+#[cfg(feature = "diagnostics")]
+fn wide_timed(jobs: Vec<Job>, timing: &WideTiming) {
+    if jobs.len() < 2 {
+        let began = std::time::Instant::now();
+        for job in jobs {
+            let working = std::time::Instant::now();
+            job();
+            timing.caller_busy_ns.fetch_add(working.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        timing.wall_ns.store(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        return;
+    }
+    let began = std::time::Instant::now();
+    let workers = workers();
+    let _wide = crate::timeline::span("work spread over threads");
+    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs {
+            let left = left.clone();
+            workers.there.fetch_add(1, Ordering::AcqRel);
+            queue.push_back(Box::new(move || {
+                job();
+                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n -= 1;
+                if *n == 0 {
+                    left.1.notify_all();
+                }
+            }));
+        }
+    }
+    workers.more.notify_all();
+    timing.dispatch_ns.store(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    loop {
+        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match job {
+            Some(job) => {
+                workers.there.fetch_sub(1, Ordering::AcqRel);
+                let working = std::time::Instant::now();
+                job();
+                timing.caller_busy_ns.fetch_add(working.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            None => break,
+        }
+    }
+    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
+    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    timing.wall_ns.store(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// [`wide_each`] with its workers' individual times, for the flush breakdown.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn wide_each_timed(n: usize, work: impl Fn(usize) + Send + Sync + 'static) -> WideEachTiming {
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let threads = (wide_threads() + 1).min(n);
+    let busy: Arc<Vec<AtomicU64>> = Arc::new((0..threads).map(|_| AtomicU64::new(0)).collect());
+    let jobs = (0..threads)
+        .map(|worker| {
+            let (next, work, busy) = (next.clone(), work.clone(), busy.clone());
+            Box::new(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let began = std::time::Instant::now();
+                    work(i);
+                    busy[worker].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }) as Job
+        })
+        .collect();
+    let timing = WideTiming::default();
+    wide_timed(jobs, &timing);
+    WideEachTiming {
+        dispatch_ns: timing.dispatch_ns.load(Ordering::Relaxed),
+        wall_ns: timing.wall_ns.load(Ordering::Relaxed),
+        caller_busy_ns: timing.caller_busy_ns.load(Ordering::Relaxed),
+        busy_ns: busy.iter().map(|n| n.load(Ordering::Relaxed)).collect(),
+    }
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -1676,6 +1783,43 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
+    #[cfg(feature = "diagnostics")]
+    if crate::host::copy_stages() {
+        let mut covered = 0u64;
+        for (shadow, address, end) in work {
+            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            if from >= to {
+                continue;
+            }
+            let start = shadow.start as usize;
+            let mut ranges: Vec<(usize, usize)> = shadow
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let (a, b) = (a.max(start + from), b.min(start + to));
+                    (a < b).then_some((a - start, b - start))
+                })
+                .collect();
+            ranges.sort_unstable_by_key(|r| r.0);
+            let mut joined: Option<(usize, usize)> = None;
+            for range in ranges {
+                match joined {
+                    Some((a, b)) if range.0 <= b => joined = Some((a, b.max(range.1))),
+                    Some((a, b)) => {
+                        covered += (b - a) as u64;
+                        joined = Some(range);
+                    }
+                    None => joined = Some(range),
+                }
+            }
+            if let Some((a, b)) = joined {
+                covered += (b - a) as u64;
+            }
+        }
+        FIND_STATS[2].fetch_add(covered, Ordering::Relaxed);
+    }
     find_pieces(scans)
 }
 
@@ -1691,6 +1835,8 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
     // A job's part of a scan: the scan, then which and place.
     type Part = (usize, usize, usize, usize, usize, usize, usize);
+    #[cfg(feature = "diagnostics")]
+    let fine = crate::host::copy_stages();
     let found: Arc<Mutex<Found>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
@@ -1719,7 +1865,15 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                         )
                     };
                     if now != old {
+                        #[cfg(feature = "diagnostics")]
+                        if fine {
+                            FIND_STATS[1].fetch_add(n as u64, Ordering::Relaxed);
+                        }
                         pieces.push((at, n));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if fine {
+                        FIND_STATS[0].fetch_add(n as u64, Ordering::Relaxed);
                     }
                     at += n;
                 }
@@ -1760,6 +1914,32 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         out[which].extend(pieces);
     }
     out
+}
+
+/// With `VICTORY_COPY_STAGES`: bytes `find_pieces` compared, bytes it found
+/// different, and bytes of those declared ranges covered by pending UAV
+/// writes (`Shadow::pending`), all since the last frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) static FIND_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The `find_pieces` byte classes for the frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn find_line(frames: f64) {
+    if !crate::host::copy_stages() {
+        return;
+    }
+    let s: Vec<f64> = FIND_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    if s[0] + s[1] + s[2] > 0.0 {
+        let written = if s[0] > 0.0 { 100.0 * s[1] / s[0] } else { 0.0 };
+        tracing::info!(
+            "find_pieces per frame (VICTORY_COPY_STAGES=1): {:.1} MB compared against snapshots, {:.1} MB ({:.1}%) found \
+             different, {:.1} MB of the declared ranges covered by pending UAV writes",
+            s[0],
+            s[1],
+            written,
+            s[2]
+        );
+    }
 }
 
 /// Since the last frame-rate line, of the shader-written ranges looked for
