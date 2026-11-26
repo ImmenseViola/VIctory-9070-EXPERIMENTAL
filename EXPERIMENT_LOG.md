@@ -72,15 +72,37 @@ camera keys, so phases 4–7 share one scene.
 | p90 | 89.6 → 82.2 | −7.4 ms | matched |
 
 Frames stayed 96.7% non-black; private 25.8 GB at stop. Verdict: clean dense
-matched win. The switch was then made the default **in this fork only**,
-pending the user's visual check.
+matched win. The switch was then made the default **in this fork only**.
+
+### `texview-visual1` — user visual check, series X
+
+The user played the default-on binary for about ten minutes. Their report:
+
+- could not tell by eye whether the frame rate was better than the main branch;
+- vegetation still pops in and out;
+- shallow water — puddles and shorelines — still renders black;
+- FPS still drops while driving;
+- car lights pop in and out / shimmer;
+- eyes looked better, but they could not confirm that against the main branch.
+
+No artifact was identified as new or caused by the cache. The run held 14–27
+fps at 2.2–10.6k draws with no pipeline creation active at the stop. Private
+memory reached 30.8 GB; the game was stopped cleanly and physical memory went
+back to ~26 GB free. Verdict: visual check passed, but memory stability and
+driving dips still block promotion to the tuned tree.
+
+### `series-s-visual1` — series-S comparison
+
+Launched on the same binary with the cache on by default, no input script and a
+passive screen/FPS/memory monitor. Pending the user's comparison of frame rate
+and softness against series X.
 
 ## Open work
 
-- User visual playtest of the view-cache-default binary.
+- Series-S user verdict from `series-s-visual1`.
 - Game A/B of `VICTORY_TEX_SKIP_NOVIEW`, alone and then combined with the
   view cache.
 - `VICTORY_TEX_HOST_CACHE` and `VICTORY_TEX_QUEUE_BATCH` experiments.
 - Full heap-texture aside only after the ahead-job refactor is safe.
-- Memory wall (~30 GB private) remains a separate stability problem; no
-  switch here claims to solve it.
+- Memory wall (~30 GB private) and driving dips remain separate stability
+  problems; no switch here claims to solve them.

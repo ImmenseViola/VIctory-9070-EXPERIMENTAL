@@ -35,7 +35,7 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 
 | Switch | Default here | A/B name | Status |
 |---|---|---|---|
-| `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win; pending user visual check |
+| `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win; user visual check done, no cache-specific artifact seen |
 | `VICTORY_TEX_SKIP_NOVIEW` | off | `VICTORY_TEX_SKIP_NOVIEW` | Built and tested; no game A/B yet |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
@@ -58,8 +58,11 @@ Unchanged:
 
 Risk: the title can write a descriptor while the texture pass runs, so a
 cached raw view can be slightly older than a fresh read later in the same
-slot. That is the only semantic change. It stays out of the tuned tree until
-the user says the picture is clean.
+slot. That is the only semantic change. The user visual check found no new
+artifact that could be blamed on it; the remaining bugs (vegetation popping,
+black puddles/shorelines, car-light shimmer, driving dips) are the ones already
+recorded in the tuned tree. It stays out of the tuned tree until a full-length
+stable run is available — see the promotion rule below.
 
 ### `VICTORY_TEX_SKIP_NOVIEW`
 
@@ -85,6 +88,19 @@ view-cache-only binary for the user's visual test.
 - no manual input during automated runs
 
 Full results are in `EXPERIMENT_LOG.md`.
+
+### User visual check (`texview-visual1`, series X)
+
+The user played the default-on binary for about ten minutes. They could not
+see an FPS difference by eye, but reported the same graphical bugs as the main
+branch: vegetation popping in and out, black puddles/shorelines, falling FPS
+while driving, and car lights popping/shimmering. Eyes looked better, but they
+could not say whether that differs from the main branch. Nothing looked like
+a new cache-specific regression. The run was stopped at 30.8 GB private with no
+shader/pipeline work active; physical memory recovered afterwards.
+
+A series-S manual comparison is running as `series-s-visual1` with the same
+binary and no input script.
 
 ## Build and run
 
@@ -118,7 +134,10 @@ Nothing here goes into the tuned tree until there is:
 3. a user visual check for shimmer, flicker, missing textures, wrong floor
    colours, and face/eye artifacts.
 
-The view cache has satisfied (1) and (2). It is waiting on (3).
+The view cache has satisfied (1) and (3): the user found no new artifact. It
+is still blocked on (2) — private memory reached 30.8 GB in the visual session
+and driving still drops frames. The tuned tree therefore keeps the old
+read-every-time path; the cache remains the default here in the experiment.
 
 ## Next cuts, in order
 
