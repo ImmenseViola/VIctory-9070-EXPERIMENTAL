@@ -93,16 +93,26 @@ driving dips still block promotion to the tuned tree.
 
 ### `series-s-visual1` — series-S comparison
 
-Launched on the same binary with the cache on by default, no input script and a
-passive screen/FPS/memory monitor. Pending the user's comparison of frame rate
-and softness against series X.
+Same binary, cache on by default, no input script, passive screen/FPS/memory
+monitor. The user found driving on quiet island roads much more responsive and
+estimated the average in the 20s. Vegetation was confirmed to fade in with
+distance and out farther away, i.e. distance-based LOD/streaming rather than a
+new artifact from the cache.
+
+Dense log (89 samples, 2k+ draws): 51.6 ms mean / 48.9 ms median, 20.3 fps
+mean. Preparing took 39.3 ms (copies 15.2 ms at 50.9 MB/frame, textures 1.5 ms);
+copying back took 10.5 ms at 9.1 MB/frame; the GPU reported only 0.27 ms of
+wait. Mean 5.7k draws. Private memory reached 29.7 GB at the stop, with no
+shader/pipeline work active. The frame is still host-bound: to reach 30 fps,
+roughly 18 ms of the dense mean has to go.
 
 ## Open work
 
-- Series-S user verdict from `series-s-visual1`.
+- Find a multi-millisecond CPU cut: copy-back and copy recording are the two
+  largest measured pieces after the texture view cache.
 - Game A/B of `VICTORY_TEX_SKIP_NOVIEW`, alone and then combined with the
   view cache.
 - `VICTORY_TEX_HOST_CACHE` and `VICTORY_TEX_QUEUE_BATCH` experiments.
 - Full heap-texture aside only after the ahead-job refactor is safe.
-- Memory wall (~30 GB private) and driving dips remain separate stability
-  problems; no switch here claims to solve them.
+- Memory wall (~30 GB private) and dense driving dips remain separate
+  stability problems; no switch here claims to solve them.

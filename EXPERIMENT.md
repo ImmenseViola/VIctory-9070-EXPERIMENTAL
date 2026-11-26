@@ -99,8 +99,13 @@ could not say whether that differs from the main branch. Nothing looked like
 a new cache-specific regression. The run was stopped at 30.8 GB private with no
 shader/pipeline work active; physical memory recovered afterwards.
 
-A series-S manual comparison is running as `series-s-visual1` with the same
-binary and no input script.
+A series-S manual comparison (`series-s-visual1`) found driving on quiet island
+roads much more responsive, averaging in the 20s. Dense logged frames were
+51.6 ms mean / 48.9 ms median, with 39.3 ms preparing (15.2 ms copies, 1.5 ms
+textures) and 10.5 ms copying back. Vegetation was confirmed to fade with
+distance, i.e. ordinary LOD/streaming rather than a new cache artifact. The
+target is now 30 fps, so the next cut must remove several milliseconds of CPU
+work, not sub-millisecond reads.
 
 ## Build and run
 
