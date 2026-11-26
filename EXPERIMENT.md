@@ -103,15 +103,28 @@ Game A/B protocol:
 Promotion requires a clean dense matched A/B, stable memory, and a visual
 check by the user. Nothing is promoted to the tuned tree until then.
 
+## `VICTORY_TEX_SKIP_NOVIEW`
+
+Also off by default and A/B-able with `VICTORY_AB=<s>,VICTORY_TEX_SKIP_NOVIEW`.
+Added in commit `3da9305`. After the room and residency gates, a due slot whose
+raw view is a constant, sampler, console sampler, unordered view, or an
+unordered placed view is finished immediately instead of being mirrored and
+then discarded a few lines later. Placed buffers and shader-resource views are
+left on the old path because their mapped/title-written state may still matter.
+
+This is read-side/early-exit only: no upload, barrier, refresh, or lifetime is
+moved. Build and tests are green (434 unit tests + replay tests). It is built
+into `target-exp2\diag\victory.exe`, leaving the `target-exp` binary from the
+view-cache A/B untouched for user test play.
+
+No game A/B has been run for this switch yet.
+
 ## Next cuts, in order
 
-1. `VICTORY_TEX_SKIP_NOVIEW` — after the room/residency gates, skip slots
-   whose cached raw view can never produce a host texture. Expected
-   0.1–0.5 ms; medium-low risk.
-2. `VICTORY_TEX_HOST_CACHE` — avoid a repeated `GetDesc`/`hosted()` and a
+1. `VICTORY_TEX_HOST_CACHE` — avoid a repeated `GetDesc`/`hosted()` and a
    second `placed_texture` per candidate. Expected 0.2–1 ms; low-medium
    risk.
-3. `VICTORY_TEX_QUEUE_BATCH` — coalesce host-slot mutex updates. Expected
+2. `VICTORY_TEX_QUEUE_BATCH` — coalesce host-slot mutex updates. Expected
    0.2–1.5 ms in backlog-heavy passes; medium risk because `room` checks
    must stay in the same places.
 
