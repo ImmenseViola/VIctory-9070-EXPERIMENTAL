@@ -40,7 +40,6 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | Switch | Default here | A/B name | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win (mostly mean/p90, median only 1–3 ms); user visual check done, no cache-specific artifact seen |
-| `VICTORY_TEX_SKIP_NOVIEW` | off | `VICTORY_TEX_SKIP_NOVIEW` | Trace found stale-descriptor paths; mirror restored in the skip branch. Off and unmeasured |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -72,38 +71,12 @@ stable run is available — see the promotion rule below.
 
 `draw.rs::slot_view_tests` now drives the same `SlotViews` helper the pass uses
 with a recorded heap: cache on and off are compared for every view kind the
-pass handles (including the ones `SKIP_NOVIEW` would short-circuit), with both
-a present and an absent handle. One test asserts the two paths see identical
-values on a stable slot while the cached path reads one handle and one view;
-another records the known difference when the title rewrites the descriptor
-mid-pass. This runs in CI, no device or game session needed. It covers read
-changes only: a switch that also skips side effects, such as `SKIP_NOVIEW`
-skipping `host.mirror`, needs a separate host-side harness and stays blocked.
-
-### `VICTORY_TEX_SKIP_NOVIEW`
-
-Off here too until it earns a place. After the room and residency gates, a due
-slot whose raw view is a constant, sampler, console sampler, unordered view, or
-unordered placed view skips texture selection, `placed_texture`, `readable`,
-staging and ahead work, then finishes. Placed buffers and shader-resource views
-are left on the old path.
-
-**The mirror-safety trace found this was not safe as first built.** Direct
-descriptor-table entries mirror the same slot, but fresh/snapshotted tables
-only copy non-texture views into dynamic slots, root descriptors never mirror
-the title slot, and SM 6.6 `ResourceDescriptorHeap[i]` /
-`SamplerDescriptorHeap[i]` indexing can read it without any same-slot mirror.
-`sync_heaps` defers constant and placed records and skips tabled ones, so it is
-not a backstop either. Skipping `host.mirror` could therefore leave an old CBV,
-sampler or UAV in the host heap, with wrong filtering or compute output.
-
-The skip branch now calls `host.mirror(index, handle, true)` before
-`texture_slot_done`, restoring the key-change descriptor build, null/unmake and
-`note_buffer` bookkeeping. That makes the switch safe to enable, but removes
-the mirror saving that was its main expected gain. It stays off and unmeasured;
-there is no reason to spend a play session on it before the copy work. It is
-built into `target-exp2\diag\victory.exe`; `target-exp\diag\victory.exe` remains
-the view-cache-only binary.
+pass handles, with both a present and an absent handle. One test asserts the two
+paths see identical values on a stable slot while the cached path reads one
+handle and one view; another records the known difference when the title
+rewrites the descriptor mid-pass. This runs in CI, no device or game session
+needed. It covers read changes only: a switch that also skips side effects needs
+a separate host-side harness and stays blocked.
 
 ## Game A/B protocol
 
@@ -203,13 +176,12 @@ supply the ~18 ms needed for 30 fps, so the order is:
    every refresh's position relative to title and shader writes.
 2. **Copy-back** — investigate why ~9 MB/frame costs 10.5 ms and cut the CPU
    side of that path without changing the read-back results.
-3. `VICTORY_HEAP_SYNC_EARLY` — one-variable A/B first if a play session is
-   available: the dense frame spends ~10.4 ms at the end waiting for heap
-   records, while the background round itself costs only ~4.7 ms.
-4. `VICTORY_TEX_SKIP_NOVIEW` — now mirror-preserving, but its main saving is
-   gone; unmeasured and low priority.
-5. Parked sub-ms texture cuts — not part of the 30 fps path.
-6. Full heap-texture aside — only after an ahead-job refactor that can carry
+3. `VICTORY_HEAP_SYNC_EARLY` — clean dense A/B done: the current early default
+   was 47.55 ms mean / 45.9 ms median at 5,676 draws, against 49.5 ms / 48.0 ms
+   with early rounds off. The end wait did not fall (9.9 ms off vs 10.8 ms on),
+   so the mechanism is unconfirmed; no default change came from this run.
+4. Parked sub-ms texture cuts — not part of the 30 fps path.
+5. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.
 
 Parallel filtering of live descriptor/title state is parked; it would change

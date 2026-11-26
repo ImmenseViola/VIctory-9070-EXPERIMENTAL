@@ -40,8 +40,6 @@ with those switches still present but off by default.
 - `0d2ccb0` — `VICTORY_TEX_VIEW_CACHE` (read-side caching).
 - `efcd784` — experiment documentation.
 - `5eb8383` — first clean A/B verdict.
-- `3da9305` — `VICTORY_TEX_SKIP_NOVIEW`.
-- `13ee0cc` — skip-noview documentation.
 - Later commits enable the view cache by default in this fork and flesh out
   the docs/tools; see `git log`.
 
@@ -115,7 +113,9 @@ moved: the top ten spans add up to ~500 MB/frame while the bus-traffic counter
 reports only ~13 MB up and ~13 MB fetched in about 50 copies. `shadow::update`
 copies only changed pieces via `watch::writes`, so the large spans are checked,
 not sent. The host log's 15.2 ms / 50.9 MB "copies" includes the whole refresh
-path, of which bus traffic is a smaller part.
+path, of which bus traffic is a smaller part. Traffic MB is per presented frame,
+but its “different pieces” count is distinct 64 KiB pieces over the whole ~5 s
+window (`traffic.rs:24-44`), not a per-frame piece count.
 
 Busy title buffers over the bus (peak / average MB up per frame, pieces):
 
@@ -139,6 +139,128 @@ This is why the next big win is likely another renderer port that stops a
 whole category of these copies (as ports 5 and 6 did), not shaving work off
 the remaining 50 calls.
 
+### `VICTORY_HEAP_SYNC_EARLY` A/B, first attempt
+
+- `heapsync-ab1` was manually assisted: the user pressed Enter while the game
+  was loading. It is diagnostic only, not a verdict. Phases 0–5 were idle
+  (4–11 draws); the stopper ended it at phase 11 because phase 11 had 11,323
+  draws against 6,299 in the preceding off phase. Passive monitor saw visible
+  gameplay (mean luma 88.7→101.6, non-black 97.0→87.5%, 19.9→22.8 GB private),
+  but the route/matched-draw requirement was not met.
+
+- `heapsync-ab2` was clean: no manual input, warmed cache, series-S, and the
+  stopper ended at phase 7 with phases 4–7 all above 5.4k draws. Passive monitor
+  saw active gameplay (mean luma 118.2 and 101.6, non-black 96.7% and 87.7%,
+  private 22.1→23.0 GB). Phase 4/5 were 50.7/48.2 ms at 5,988/5,492 draws;
+  phase 6/7 were 48.3/46.9 ms at 5,603/5,859 draws. Grouped, the current early
+  default (`bits=1`, early rounds on) was 47.55 ms mean / 45.9 ms median at
+  5,676 draws, against 49.5 ms / 48.0 ms at 5,796 draws with early rounds off.
+  That is a ~2 ms win, but the measured end wait for heap records did not fall
+  (9.9 ms off vs 10.8 ms on), so the mechanism is not confirmed. No default is
+  changed by this run; the early rounds are already the current default.
+
+### Fetch-heavy `0x962440000` — read-touch evidence needed
+
+The premise that ~8 MB is fetched in ~720 pieces per frame mixes two regimes.
+`traffic.rs:24-44` divides bytes by presented frames but leaves the “different
+pieces” count as a distinct-piece count for the whole ~5 s interval. The early
+lines (`series-s-visual1-stderr.txt:5970`, `6201`) are upload-heavy: 0.30–0.34
+MB/frame up in 720 distinct 64 KiB pieces, 0.00 MB fetched. Later fetch-heavy
+lines (`:15378`, `:19951`, `:21221`) cover only 274, 133 and 137 distinct pieces
+for 1.33, 7.56 and 8.05 MB/frame fetched. So the log proves neither that the
+title CPU reads all of this 45 MiB span each frame nor that it reads only a
+subset.
+
+Fetch selection is not CPU-read telemetry. `relay_card_back`
+(`host.rs:4864-4878`) builds flag sets from `!r.compared` and `torn::flagged`;
+`flagged_pieces` (`host.rs:2710-2723`) picks pieces; then `host.rs:4884-4904`,
+`4937-4940`, `4977-5010`, `5043-5069` fetch, count, copy back and merge them.
+`copystat` “MB/frame” is host refresh/upload work, not title CPU reads
+(`copystat.rs:1574-1579`), and can exceed the 45 MiB allocation because a range
+can be refreshed more than once per frame.
+
+The watcher has no general read-touch counter: the guard handler records WRITE
+faults (`watch.rs:3822-3841`) and only retries read faults after remaps
+(`watch.rs:3851-3857`, `3569-3595`). `VICTORY_PAGE_WRITES=0` counts only
+completed raw DirectStorage/kernel reads into plain addresses
+(`watch.rs:3338-3368`, `3391-3399`; `dstorage.rs:1611-1615`), a path normally
+bypassed by `VICTORY_STREAM_NOTICE` (`xmem.rs:605-607`). A `PAGE_GUARD`
+read-touch probe is possible in principle, but a fault handler cannot safely
+perform the GPU fetch itself; it must stall the reader until the existing
+ordered fetch path completes, or rely on an earlier prefetch with the same
+ordering guarantees (`host.rs:2622-2636`, `4977-5069`).
+
+**Verdict:** defer-fetch is *needs measurement*, not ready for code. Smallest
+evidence step: log a per-frame 64 KiB read-touch bitmap for exactly
+`[0x962440000, 0x962744000)` beside the `FETCHED` piece set, with fetch
+behaviour unchanged. If the touch set is consistently near all 720 pieces,
+the idea is dead; if it is small and stable, test a first-touch design that
+preserves the current completion ordering.
+
+### Refresh spans — written pieces alone cannot drive them
+
+The dense line `refreshes 9.7 in 31 flushes of 7959, 6950 of them known to copy
+nothing, 7948 on several threads` (`series-s-visual1-stderr.txt:54042`) is a
+dispatch-policy result, not missing knowledge. `FLUSHES[1]` is spans,
+`FLUSHES[2]` known-nothing spans, `FLUSHES[3]` spans handed to `wide_each`
+(`host.rs:7761-7764`, `7797-7813`). Only 11 were removed by the submitting
+thread; about 6,939 became known-nothing inside the worker. With
+`VICTORY_LIGHT_REFRESH` and port 6 on, `refresh_spans` sets `many` almost
+always (`host.rs:8507-8510`), `flush_all` skips its prefilter too
+(`host.rs:8667-8679`), and the predicate is repeated per worker
+(`host.rs:8533-8536`, `8707-8710`). `wide_each` only schedules indices
+(`shadow.rs:1585-1607`).
+
+`Shadow::nothing_new` (`shadow.rs:3997-4022`) is the real decision: in-place or
+empty range, watched state not `NOT_WATCHED`, no overlapping pending shader
+write, and `watch::nothing_new` coverage by clean guarded bits or an asking
+hold with no newer note (`watch.rs:1425-1442`). Written pieces are real but
+page-oriented: `GetWriteWatch` parts folded to 64 KiB bits (`watch.rs:40-43`,
+`709-768`), monotonic timestamps (`81-120`, `149-164`), guard `PUBLISHED` set
+after an ask and cleared when the block becomes writable or remaps
+(`1882-1895`, `2193-2201`), our writes noted while an ask stands (`1236-1260`;
+`host.rs:7598`, `host/place.rs:96`, `memory.rs:628/649`), and copy-back notes
+made only after the bytes have landed (`land.rs:614`, `watch.rs:2616-2631`,
+`2644-2647`, `2651-2700`).
+
+That is not complete enough by itself. `ask_once` only gathers refresh ranges
+on shadows that asked ahead (`host.rs:5823-5836`; `shadow.rs:3125-3128`);
+unwatched and guarded-light copies are not asked. `ask_ahead_held` drops
+published/refused ranges and ranges under two pieces (`watch.rs:789-799`), and
+`ask_rest` skips them (`1127-1135`). Kernel ask failures can leave no hold and
+mark the copy `NOT_WATCHED` (`shadow.rs:4034-4058`). `copied` is stamped only
+for whole 64 KiB pages (`shadow.rs:4125-4151`), `ranged` keeps only the
+last/longest fully taken range (`4174-4180`), so partial ends stay stale.
+Pending shader writes are invisible to the kernel watch and force copies of
+the gaps (`shadow.rs:3231-3233`, `3966-3992`). `ask_once_end` clears the hold
+and `Step::Run` ends it mid-submission (`watch.rs:1219-1230`,
+`host.rs:7656-7660`); `wrote` is skipped without a standing ask
+(`watch.rs:1239-1246`), title writes during preparation are deferred
+(`1076-1081`), and `VICTORY_WATCH_CAP` can drop notes after the dirty bit is
+reset (`57-75`, `1019-1046`). The safe unit is the whole conjunction: asking or
+publication coverage, watched state, no pending shader write, complete
+`copied`/`ranged` coverage, and no newer note.
+
+`run_deferred`/`Batch` must preserve every refresh's byte set and submission
+position. `Step::Copy` flushes pending refreshes before the title write
+(`host.rs:7588-7589`; `title_written` at `8399-8403`) and then notes our own
+write (`7596-7598`). `Step::GpuWrite` flushes that copy's pending refresh and
+then declares pending shader writes (`7668-7683`; `shadow.rs:3250-3270`).
+Copy-back notes land only after the bytes are in. Therefore a cached skip must
+be invalidated at `wrote`, `ask_once_end`, `title_written`, `writing`, landing
+notes, and remap/open events; the current
+`refresh_front`→`refresh_ahead`→`run_deferred`→`fill/flush`→`ask_once_end`
+order (`host.rs:5840-5898`) is the ordering contract. Extra bytes can overwrite
+newer title/shader writes; missing bytes leave the card copy stale.
+
+**Verdict:** no code yet. First add reason counters to `Shadow::nothing_new`,
+tag each `FLUSHES[2]` increment with its site, and verify a sampled set of
+skipped spans with the `refresh_check` read-only pattern
+(`shadow.rs:4061-4115`). Then A/B with `VICTORY_REFRESH_CHECK=1` and
+`VICTORY_UPCOPY_CHECK=1`, plus `WATCH_CAP`, `PAGE_PARTS=0` and
+`PORT_GUARD_PLAN` stress cases. Moving the predicate back onto the submitting
+thread would move the 9.7 ms, not remove it (`watch.rs:1563-1571`).
+
 ## Open work
 
 - Find a multi-millisecond CPU cut: copy recording (15.2 ms) and copy-back
@@ -149,16 +271,11 @@ the remaining 50 calls.
   byte/order-preserving change to copy recording (`host.rs::run_deferred`,
   `host.rs::Batch`), where ~6900 of ~7900 refresh spans per frame are known to
   copy nothing. Sub-ms texture cuts cannot reach 30 fps.
-- `VICTORY_TEX_SKIP_NOVIEW` mirror trace finished: unsafe as built. Direct
-  table entries mirror, but fresh tables, root descriptors and SM 6.6 direct
-  heap indexing do not always mirror a constant/sampler/UAV same-slot before
-  use; `sync_heaps` defers and skips tabled records. The skip branch now calls
-  `host.mirror(index, handle, true)` before `texture_slot_done`. Still off and
-  unmeasured; no game A/B planned while copy work is the priority.
+- The texture no-view early-finish switch was dropped: restoring `host.mirror` removed its only substantial saving, so it was not worth an A/B.
 - Parked sub-ms texture cuts are not part of the 30 fps path.
-- A/B `VICTORY_HEAP_SYNC_EARLY` first: dense frames spend ~10.4 ms waiting for
-  heap records at the end of submission, while the background round itself
-  costs only ~4.7 ms on all threads. One-variable A/B already exists.
+- `VICTORY_HEAP_SYNC_EARLY` A/B is done: the current early default measured
+  ~2 ms better in the clean dense cycle, but its end wait did not fall, so it
+  is not a proven mechanism. No default change; copy recording is next.
 - Full heap-texture aside only after the ahead-job refactor is safe.
 - Memory wall (~30 GB private) and dense driving dips remain separate
   stability problems; no switch here claims to solve them. The promotion test

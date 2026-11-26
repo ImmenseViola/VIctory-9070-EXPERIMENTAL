@@ -260,7 +260,6 @@ the tuned `ImmenseViola/VIctory-9070` tree carries neither.
 | Switch | Default here | What it does | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | Reads each texture slot's heap handle and raw view once, instead of on every look in that slot | Clean dense A/B win (4.5-7.8 ms mean, 2.8-7.4 ms p90); visual check found no new artifact, still blocked on memory stability |
-| `VICTORY_TEX_SKIP_NOVIEW` | off | Early-finishes due slots whose view can never name a host texture, after mirroring them | Trace found stale-descriptor paths; mirror restored. Off and unmeasured |
 
 To get the tuned behaviour, launch with `VICTORY_TEX_VIEW_CACHE=0`. For a
 one-run comparison use `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`; a switch named

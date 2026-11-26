@@ -224,20 +224,6 @@ fn tex_view_cache() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_none_or(|v| v != "0"))
 }
 
-/// Whether the texture pass gives up on a due slot whose raw view can never
-/// name a host texture (`VICTORY_TEX_SKIP_NOVIEW=1`; off by default; A/B-able
-/// with `VICTORY_AB=<s>,VICTORY_TEX_SKIP_NOVIEW`). This is checked only after
-/// the room and residency gates, and only for view kinds the normal path
-/// discards at the same point without an upload.
-fn tex_skip_noview() -> bool {
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if let Some(on) = crate::ab::pick("VICTORY_TEX_SKIP_NOVIEW") {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_SKIP_NOVIEW").is_some_and(|v| v == "1"))
-}
-
 /// The two reads `heap_textures` makes of a slot, kept apart from the pass so
 /// a unit test can drive `VICTORY_TEX_VIEW_CACHE` on and off over a recorded
 /// heap and compare what each path sees.
@@ -2485,7 +2471,6 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let view_cache = tex_view_cache();
-        let skip_noview = tex_skip_noview();
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -2645,28 +2630,6 @@ impl State {
             if !crate::residency::admit_texture_pass(required) {
                 served = false;
                 break;
-            }
-            // Experimental `VICTORY_TEX_SKIP_NOVIEW`: these kinds are thrown
-            // away by the ordinary path just below (it only accepts a shader
-            // view of a texture), without an upload or a retry. Taking them
-            // here avoids placed_texture, readable, staging and ahead work.
-            // It must still mirror the slot: fresh tables and SM 6.6 direct
-            // heap indexing do not always mirror a constant, sampler or UAV
-            // before use, so skipping this call left stale host descriptors.
-            // Placed buffers are left alone; their mapped state above may
-            // still be due.
-            if skip_noview
-                && matches!(
-                    raw_view().as_ref(),
-                    Some(View::Constant(..) | View::Sampler(..) | View::ConsoleSampler(..) | View::Unordered(..))
-                        | Some(View::Placed(true, ..))
-                )
-            {
-                if let Some(handle) = handle() {
-                    let _ = host.mirror(index, handle, true);
-                }
-                host.texture_slot_done(index, write, None);
-                continue;
             }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
@@ -4879,8 +4842,8 @@ mod record_hash_tests {
 /// needs a device and a title heap; these tests drive the same `SlotViews`
 /// helper with a recorded heap instead, so CI can check that the cache only
 /// changes how often a slot is read, not what a stable slot shows. A switch
-/// that also skips side effects, such as `VICTORY_TEX_SKIP_NOVIEW` skipping
-/// `host.mirror`, is deliberately not covered here — see `EXPERIMENT.md`.
+/// that also skips side effects needs a separate host-side harness and is
+/// deliberately not covered here.
 #[cfg(test)]
 mod slot_view_tests {
     use std::cell::{Cell, RefCell};
