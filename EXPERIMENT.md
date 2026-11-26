@@ -115,6 +115,13 @@ the view-cache-only binary.
   shader/pipeline creation
 - no manual input during automated runs
 
+The next one-variable run uses the same route with
+`VICTORY_AB=20,VICTORY_HEAP_SYNC_EARLY`: dense frames spend ~10.4 ms at the
+end of submission waiting for heap records, while the background round itself
+costs only ~4.7 ms across all threads. It changes when the existing descriptor
+round runs, not which bytes upload. Compare frame ms, the end-wait line,
+private memory, then do a visual check before any default change.
+
 Full results are in `EXPERIMENT_LOG.md`. The cache's win is mostly in the mean
 (4.5–7.8 ms) and p90 (2.8–7.4 ms); medians moved only 1–3 ms, so it mainly
 helps the worst frames rather than the typical one.
@@ -140,8 +147,8 @@ work, not sub-millisecond reads.
 ## Build and run
 
 ```powershell
-cd 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-9070-EXPERIMENTAL'
-$env:CARGO_TARGET_DIR='C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-9070-EXPERIMENTAL\target-exp'
+cd 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL'
+$env:CARGO_TARGET_DIR='C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target-exp'
 cargo test -p victory-gpu --features diagnostics
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
@@ -149,11 +156,11 @@ cargo build --locked --profile diag -p victory --features diagnostics
 Quick start for user test play (view cache on by default, no input script):
 
 ```powershell
-& 'C:\Users\Admin\AppData\Local\Temp\opencode\start-play-session.ps1' `
+& 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\tools\start-play-session.ps1' `
   -Tag texview-visual1 `
-  -Binary 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-9070-EXPERIMENTAL\target-exp\diag\victory.exe' `
+  -Binary 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target-exp\diag\victory.exe' `
   -Console series-x -Upscaler 6 `
-  -Cache 'C:\Users\Admin\AppData\Local\Temp\opencode\victory-7900-clean-cache-1' `
+  -Cache 'C:\mygame\victory-work\victory-7900-clean-cache-1' `
   -Extra @{ VICTORY_CARD_BUFFERS_MIN_MB='1'; VICTORY_LATE_WAIT='3'; VICTORY_KEYS='' }
 ```
 
@@ -210,8 +217,7 @@ which bytes upload.
 
 ## Local data safety
 
-The working tree, logs, and warmed cache currently live under
-`AppData\Local\Temp\opencode`. Windows Storage Sense can clear Temp, which
-would lose the warmed version-3 cache and force a long recompile. Copy or move
-the tree and cache to a permanent folder, and point the scripts in `tools/` at
-it before relying on them.
+The working tree and warmed cache live under `C:\mygame\victory-work`, outside
+Temp, so Windows Storage Sense cannot clear the warmed version-3 cache. The
+paths in this file and in `tools/README.md` point there. Historical play logs
+remain under `AppData\Local\Temp\opencode` and are not needed to rebuild.

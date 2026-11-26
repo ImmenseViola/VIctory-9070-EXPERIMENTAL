@@ -9,8 +9,8 @@ param(
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$out = "C:\Users\Admin\AppData\Local\Temp\opencode\$Tag-monitor.csv"
-$log = "C:\Users\Admin\AppData\Local\Temp\opencode\$Tag-stderr.txt"
+$out = "C:\mygame\victory-work\$Tag-monitor.csv"
+$log = "C:\mygame\victory-work\$Tag-stderr.txt"
 
 function Shot([string] $path) {
     $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -54,8 +54,8 @@ Start-Sleep -Seconds $WarmupSeconds
 for ($i = 0; $i -lt $Samples; $i++) {
     $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
     if (-not $p -or $p.HasExited) { " $(Get-Date -Format o),EXITED" | Add-Content -Encoding ascii $out; break }
-    $aPath = "C:\Users\Admin\AppData\Local\Temp\opencode\$Tag-motion-a.png"
-    $bPath = "C:\Users\Admin\AppData\Local\Temp\opencode\$Tag-motion-b.png"
+    $aPath = "C:\mygame\victory-work\$Tag-motion-a.png"
+    $bPath = "C:\mygame\victory-work\$Tag-motion-b.png"
     Shot $aPath
     Start-Sleep -Seconds 8
     Shot $bPath

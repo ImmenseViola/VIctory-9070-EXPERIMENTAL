@@ -3,7 +3,7 @@ param(
     [int] $FirstPhase = 0
 )
 
-$root = 'C:\Users\Admin\AppData\Local\Temp\opencode'
+$root = 'C:\mygame\victory-work'
 $log = Join-Path $root "$Tag-stderr.txt"
 $rows = @()
 Get-Content $log | ForEach-Object {

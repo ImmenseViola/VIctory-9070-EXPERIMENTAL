@@ -5,15 +5,15 @@ param(
     [hashtable] $Extra = @{},
     [switch] $Guard,
     [switch] $NoPanel,
-    [string] $Cache = 'C:\Users\Admin\AppData\Local\Temp\opencode\victory-7900-final-cache',
-    [string] $Binary = 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-7900XTX\target\diag\victory.exe'
+    [string] $Cache = 'C:\mygame\victory-work\victory-7900-clean-cache-1',
+    [string] $Binary = 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target-exp\diag\victory.exe'
 )
 
-$repo = 'C:\Users\Admin\AppData\Local\Temp\opencode\VIctory-7900XTX'
+$repo = 'C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL'
 $victory = $Binary
 if (-not [System.IO.Path]::IsPathRooted($victory)) { $victory = Join-Path $repo $victory }
 $game = 'C:\mygame\warriors and stuff\game_scarlett_master.exe'
-$out = 'C:\Users\Admin\AppData\Local\Temp\opencode'
+$out = 'C:\mygame\victory-work'
 $cache = $Cache
 
 if (Get-Process -Name victory -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited }) {

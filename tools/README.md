@@ -1,10 +1,10 @@
 # Local harness scripts
 
 These are the Windows PowerShell scripts used to launch and measure the A/B
-runs recorded in [EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md). They are copied
-from the tuning harness as-is, so the default paths point at this machine's
-`C:\Users\Admin\AppData\Local\Temp\opencode` workspace. Edit them for your own
-setup.
+runs recorded in [EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md). Their default
+paths point at this machine's permanent `C:\mygame\victory-work` workspace:
+the experimental repo, warmed cache, and future logs live there. Edit them
+for your own setup.
 
 | Script | Purpose |
 |---|---|
@@ -21,7 +21,7 @@ Typical A/B launch:
 & .\tools\start-play-session.ps1 -Tag texview-ab2 `
   -Binary ..\target-exp\diag\victory.exe `
   -Console series-x -Upscaler 6 `
-  -Cache 'C:\Users\Admin\AppData\Local\Temp\opencode\victory-7900-clean-cache-1' `
+  -Cache 'C:\mygame\victory-work\victory-7900-clean-cache-1' `
   -Extra @{
     VICTORY_CARD_BUFFERS_MIN_MB='1'
     VICTORY_LATE_WAIT='3'

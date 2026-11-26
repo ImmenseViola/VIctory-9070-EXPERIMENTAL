@@ -7,7 +7,7 @@ param(
     [int[]] $CycleEnds = @(7, 11, 15, 19, 23)
 )
 
-$root = 'C:\Users\Admin\AppData\Local\Temp\opencode'
+$root = 'C:\mygame\victory-work'
 $log = Join-Path $root "$Tag-stderr.txt"
 $deadline = (Get-Date).AddMinutes($MaxMinutes)
 $reason = 'timeout'

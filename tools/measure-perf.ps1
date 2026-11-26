@@ -5,7 +5,7 @@ param(
     [int] $IntervalSeconds = 30
 )
 
-$root = 'C:\Users\Admin\AppData\Local\Temp\opencode'
+$root = 'C:\mygame\victory-work'
 $log = Join-Path $root "$Tag-stderr.txt"
 $out = Join-Path $root "$Tag-perf.csv"
 
