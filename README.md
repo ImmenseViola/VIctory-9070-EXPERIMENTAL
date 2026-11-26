@@ -236,8 +236,8 @@ The tuned renderer patches are off by default as upstream exposes them:
 
 Other useful tuned switches are `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_LATE_WAIT=1`,
 `VICTORY_THIN=1`, `VICTORY_RELAY=1`/`2`, `VICTORY_UPSCALER=6`,
-`VICTORY_RESIDENCY=1`, and the `VICTORY_HEAP_*`, `VICTORY_CARD_*`,
-`VICTORY_PIPELINE_WAIT_SHARED`, `VICTORY_WIDE_REFRESH` and
+`VICTORY_RESIDENCY=1`, plus the heap (`VICTORY_HEAP_TEXTURES=0`) and card
+(`VICTORY_CARD_STEPS=2`) settings, `VICTORY_PIPELINE_WAIT_SHARED`, `VICTORY_WIDE_REFRESH` and
 `VICTORY_LIGHT_REFRESH` settings from [docs/findings.md](docs/findings.md).
 
 **Do not use these for a release build** unless you are deliberately
@@ -260,7 +260,7 @@ the tuned `ImmenseViola/VIctory-9070` tree carries neither.
 | Switch | Default here | What it does | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | Reads each texture slot's heap handle and raw view once, instead of on every look in that slot | Clean dense A/B win (4.5-7.8 ms mean, 2.8-7.4 ms p90); visual check found no new artifact, still blocked on memory stability |
-| `VICTORY_TEX_SKIP_NOVIEW` | off | Early-finishes due slots whose view can never name a host texture | Built and unit-tested, but skips `host.mirror` work; A/B blocked pending a draw-time mirror-safety trace |
+| `VICTORY_TEX_SKIP_NOVIEW` | off | Early-finishes due slots whose view can never name a host texture, after mirroring them | Trace found stale-descriptor paths; mirror restored. Off and unmeasured |
 
 To get the tuned behaviour, launch with `VICTORY_TEX_VIEW_CACHE=0`. For a
 one-run comparison use `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`; a switch named

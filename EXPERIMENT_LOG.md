@@ -143,15 +143,22 @@ the remaining 50 calls.
 
 - Find a multi-millisecond CPU cut: copy recording (15.2 ms) and copy-back
   (10.5 ms) are the two largest measured pieces; the texture pass is only
-  1.5 ms now. Bus-traffic composition is above; the next step is to map the
-  six busy buffers to title heaps and test whether `port::place_for` can place
-  any of them in place instead of copying. Sub-ms texture cuts cannot reach
-  30 fps.
-- Draw-time mirror-safety trace for `VICTORY_TEX_SKIP_NOVIEW`. It skips
-  `host.mirror` bookkeeping, so the game A/B is blocked until every binding
-  path for those view kinds is shown to mirror first.
-- `VICTORY_TEX_HOST_CACHE` and `VICTORY_TEX_QUEUE_BATCH` are parked sub-ms
-  cuts, not part of the 30 fps path.
+  1.5 ms now. Bus-traffic composition is above, but the big buffers sit above
+  4 GiB, outside `port::place_for`'s low-4-GiB graphics region; placing them in
+  title memory would reintroduce PCIe-bound shader reads. The next step is a
+  byte/order-preserving change to copy recording (`host.rs::run_deferred`,
+  `host.rs::Batch`), where ~6900 of ~7900 refresh spans per frame are known to
+  copy nothing. Sub-ms texture cuts cannot reach 30 fps.
+- `VICTORY_TEX_SKIP_NOVIEW` mirror trace finished: unsafe as built. Direct
+  table entries mirror, but fresh tables, root descriptors and SM 6.6 direct
+  heap indexing do not always mirror a constant/sampler/UAV same-slot before
+  use; `sync_heaps` defers and skips tabled records. The skip branch now calls
+  `host.mirror(index, handle, true)` before `texture_slot_done`. Still off and
+  unmeasured; no game A/B planned while copy work is the priority.
+- Parked sub-ms texture cuts are not part of the 30 fps path.
+- A/B `VICTORY_HEAP_SYNC_EARLY` first: dense frames spend ~10.4 ms waiting for
+  heap records at the end of submission, while the background round itself
+  costs only ~4.7 ms on all threads. One-variable A/B already exists.
 - Full heap-texture aside only after the ahead-job refactor is safe.
 - Memory wall (~30 GB private) and dense driving dips remain separate
   stability problems; no switch here claims to solve them. The promotion test
