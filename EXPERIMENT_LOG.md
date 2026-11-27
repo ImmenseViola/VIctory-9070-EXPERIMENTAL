@@ -448,3 +448,13 @@ Verification before push: `cargo check --workspace --all-features --locked`,
 --all-targets --all-features --locked -- -D warnings`, `cargo build --locked
 --profile diag -p victory --features diagnostics`, and `git diff --check` all
 passed. No game result yet; no default changed.
+
+Push note: the first push of `7c78e2a` mistakenly used the `origin` remote,
+which is the tuned `VIctory-9070` repository, and created a branch there as
+well as moving its `main`. It was corrected immediately: the stray branch was
+deleted and tuned `main` was force-restored to `5194620`; `git ls-remote` now
+shows tuned `main` at `5194620` and no stray branch. The commit was then pushed
+to the `experimental` remote, whose `main` and `experimental/texture-pass-aside`
+both point at `7c78e2a`. Future pushes must name the `experimental` remote
+explicitly.
+
