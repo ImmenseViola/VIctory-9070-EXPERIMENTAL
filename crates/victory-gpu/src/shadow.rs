@@ -51,8 +51,9 @@ pub(crate) struct Shadow {
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    /// title memory there is older than the copy. The vector is authoritative
+    /// and keeps insertion order; the index only answers overlap questions.
+    pending: Mutex<Pending>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -732,8 +733,11 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         if from >= to {
             continue;
         }
-        let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let busy = shadow
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .overlapping(from, to, pending_index());
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -990,6 +994,119 @@ impl Flights {
         }
         free.sort_unstable();
         free
+    }
+}
+
+/// The authoritative list of ranges shaders may still be writing, plus an
+/// advisory index over it. The index never changes what is copied: it only
+/// answers the same overlap questions the old linear scans answered. Entries
+/// are `(start, end, position in ranges)`, sorted by start; `prefix_max_end`
+/// is the greatest end up to each entry, so a boolean overlap is a prefix
+/// maximum followed by one comparison. `ranges` stays in insertion order and
+/// is what every answer is read back from.
+#[derive(Default)]
+struct Pending {
+    ranges: Vec<(usize, usize)>,
+    by_start: Vec<(usize, usize, usize)>,
+    prefix_max_end: Vec<usize>,
+    indexed: bool,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn rebuild(&mut self) {
+        self.by_start.clear();
+        for (i, &(a, e)) in self.ranges.iter().enumerate() {
+            self.by_start.push((a, e, i));
+        }
+        self.by_start.sort_unstable();
+        self.prefix_max_end.resize(self.by_start.len(), 0);
+        let mut max = 0;
+        for (max_end, &(_, e, _)) in self.prefix_max_end.iter_mut().zip(self.by_start.iter()) {
+            max = max.max(e);
+            *max_end = max;
+        }
+        self.indexed = true;
+    }
+
+    fn ensure(&mut self) {
+        if !self.indexed {
+            self.rebuild();
+        }
+    }
+
+    fn push(&mut self, range: (usize, usize)) {
+        let i = self.ranges.len();
+        self.ranges.push(range);
+        if self.indexed {
+            let at = self.by_start.partition_point(|&(a, e, j)| (a, e, j) < (range.0, range.1, i));
+            self.by_start.insert(at, (range.0, range.1, i));
+            self.prefix_max_end.resize(self.by_start.len(), 0);
+            let mut max = 0;
+            for (max_end, &(_, e, _)) in self.prefix_max_end.iter_mut().zip(self.by_start.iter()) {
+                max = max.max(e);
+                *max_end = max;
+            }
+        }
+    }
+
+    fn retain<F: FnMut(&(usize, usize)) -> bool>(&mut self, enabled: bool, mut keep: F) {
+        let before = self.ranges.len();
+        self.ranges.retain(|r| keep(r));
+        if self.ranges.len() == before {
+            return;
+        }
+        if enabled {
+            self.rebuild();
+        } else {
+            self.by_start.clear();
+            self.prefix_max_end.clear();
+            self.indexed = false;
+        }
+    }
+
+    fn contains_exact(&mut self, range: (usize, usize), enabled: bool) -> bool {
+        if !enabled {
+            return self.ranges.contains(&range);
+        }
+        self.ensure();
+        let first = self.by_start.partition_point(|&(a, _, _)| a < range.0);
+        self.by_start[first..]
+            .iter()
+            .take_while(|&&(a, _, _)| a == range.0)
+            .any(|&(_, e, _)| e == range.1)
+    }
+
+    fn any_overlap(&mut self, from: usize, to: usize, enabled: bool) -> bool {
+        if !enabled {
+            return self.ranges.iter().any(|&(a, e)| a < to && e > from);
+        }
+        self.ensure();
+        let count = self.by_start.partition_point(|&(a, _, _)| a < to);
+        count > 0 && self.prefix_max_end[count - 1] > from
+    }
+
+    /// The overlapping ranges in the same order as the old `pending` scan, so
+    /// gap sets and clipped ranges are byte-for-byte unchanged.
+    fn overlapping(&mut self, from: usize, to: usize, enabled: bool) -> Vec<(usize, usize)> {
+        if !enabled {
+            return self.ranges.iter().copied().filter(|&(a, e)| a < to && e > from).collect();
+        }
+        self.ensure();
+        let count = self.by_start.partition_point(|&(a, _, _)| a < to);
+        if count == 0 || self.prefix_max_end[count - 1] <= from {
+            return Vec::new();
+        }
+        let mut found: Vec<(usize, usize, usize)> = self.by_start[..count]
+            .iter()
+            .copied()
+            .filter(|&(_, e, _)| e > from)
+            .collect();
+        found.sort_unstable_by_key(|&(_, _, i)| i);
+        found.into_iter().map(|(_, _, i)| self.ranges[i]).collect()
     }
 }
 
@@ -1464,6 +1581,11 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Index of the first helper that must stand down for this dispatch. Helpers
+/// above it wait without spinning, so raising the pool costs no CPU while the
+/// switch is off.
+static ACTIVE_WIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
@@ -1471,6 +1593,18 @@ struct Workers {
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
+}
+
+static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+
+/// Put the extra helpers on call before a dispatch that needs them. They wait
+/// without spinning while off, so a raise must wake them; a drop needs no
+/// wake, they see it on their next loop.
+fn set_active_wide(active: usize, workers: &Workers) {
+    let before = ACTIVE_WIDE.swap(active, Ordering::AcqRel);
+    if active > before {
+        workers.more.notify_all();
+    }
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
@@ -1490,13 +1624,66 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// The usual number of helper threads kept for [`wide`], leaving most of the
+/// title's threads alone (12 logical threads: three helpers plus the caller).
 fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// Cut 1b: more helpers can be kept alive, but are idle at the usual count.
+/// `VICTORY_WIDE_THREADS_MAX` only raises the pool a run may switch into. The
+/// default ceiling is six, matching the canonical combined run;
+/// `VICTORY_WIDE_THREADS_MAX=3` restores the old ceiling.
+fn max_wide_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let asked = *MAX.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(6)
+    });
+    asked.clamp(wide_threads(), 16)
+}
+
+/// The helper count this call uses. `VICTORY_WIDE_REFRESH_MORE` is on by
+/// default and uses the run's `VICTORY_WIDE_THREADS_MAX` ceiling;
+/// `VICTORY_WIDE_REFRESH_MORE=0` uses the usual count. A named `VICTORY_AB`
+/// switch decides it at every dispatch, so the pool already holds the extra
+/// idle threads. Only who claims a piece changes, never what a piece is.
+fn active_wide_threads() -> usize {
+    let base = std::env::var("VICTORY_WIDE_HELPERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(wide_threads);
+    let more = experiment("VICTORY_WIDE_REFRESH_MORE", || {
+        static MORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MORE.get_or_init(|| crate::switch::default_on("VICTORY_WIDE_REFRESH_MORE"))
+    });
+    let active = if more { max_wide_threads() } else { base };
+    active.clamp(wide_threads(), max_wide_threads())
+}
+
+/// Advisory index over the pending write ranges. On by default;
+/// `VICTORY_PENDING_INDEX=0` restores the old scans. A/B-able; the vector
+/// stays authoritative and every indexed answer is compared with the old
+/// scan by `pending_index_tests`.
+fn pending_index() -> bool {
+    experiment("VICTORY_PENDING_INDEX", || {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::default_on("VICTORY_PENDING_INDEX"))
+    })
+}
+
+/// Shared experiment reader for the shadow wide path.
+fn experiment(_name: &str, default: impl FnOnce() -> bool) -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::switched(_name) {
+        return on;
+    }
+    default()
+}
+
 fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
@@ -1504,12 +1691,19 @@ fn workers() -> &'static Workers {
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        for i in 0..wide_threads() {
+        ACTIVE_WIDE.store(active_wide_threads(), Ordering::Relaxed);
+        for i in 0..max_wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    let job = {
+                    let job = if i >= ACTIVE_WIDE.load(Ordering::Relaxed) {
+                        // Spare helpers wait without spinning; this costs no
+                        // CPU while the wide-thread switch is off.
+                        let jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        let _wait = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    } else {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
@@ -1541,6 +1735,7 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
+    set_active_wide(active_wide_threads(), workers);
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
@@ -1588,7 +1783,8 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let active = active_wide_threads();
+    let threads = (active + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
@@ -3252,6 +3448,7 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        let indexed = pending_index();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3259,7 +3456,7 @@ impl Shadow {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
+        if pending.contains_exact(range, indexed) {
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
@@ -3273,7 +3470,7 @@ impl Shadow {
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        for (a, e) in pending.overlapping(address, address + len, indexed) {
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -3573,12 +3770,13 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        let indexed = pending_index();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| free.binary_search(r).is_err());
+            pending.retain(indexed, |r| free.binary_search(r).is_err());
         } else {
-            pending.retain(|r| !ranges.contains(r));
+            pending.retain(indexed, |r| !ranges.contains(r));
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -3643,7 +3841,10 @@ impl Shadow {
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .any_overlap(from, to, pending_index())
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3667,9 +3868,9 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .overlapping(from, to, pending_index())
+            .into_iter()
+            .map(|(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -3711,17 +3912,18 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .overlapping(from, to, pending_index())
+            .into_iter()
+            .map(|(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            note_stale(0);
-            return true;
-        }
+        // A copy whose refresh could not ask the watch keeps its NOT_WATCHED
+        // mark, but that must not make every flight over it wait: the
+        // reference below holds the bytes the copy had before the flight, so
+        // the pages can be compared directly. Only when there is no reference
+        // (or too many changed runs) does the settle remain necessary.
         // The declared ranges overlap (views of the title's whole heap from
         // dozens of offsets): as one range each page is asked about and
         // compared once. Every byte of it is in a declared range, and of a
@@ -3737,9 +3939,18 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
+            let (now, written) = match crate::watch::writes(a, e, true) {
+                Some(known) => known,
+                None => {
+                    // No watch can say which pages the title wrote. Compare
+                    // every page of the span with the reference instead: a
+                    // fresh asking number makes `stale_pages_in` take them
+                    // all, and `merge_page_under_writes` keeps only the dwords
+                    // that really differ, so shader-only writes survive.
+                    let now = crate::watch::next_asking();
+                    let written = (a / PAGE..e.div_ceil(PAGE)).map(|page| (page, now)).collect();
+                    (now, written)
+                }
             };
             let t = under_ns(0, t);
             let stale: Vec<usize> = {
@@ -3957,10 +4168,7 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+            .overlapping(from, to, pending_index());
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3997,7 +4205,12 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .any_overlap(from, to, pending_index())
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5884,4 +6097,151 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod more_wide_tests {
+    use super::*;
+
+    /// The wide path hands each number to one caller exactly once, with the
+    /// usual helpers and with switched-in more helpers. This is the
+    /// byte/order-equivalence guarantee behind `VICTORY_WIDE_REFRESH_MORE`:
+    /// only who claims a piece changes, never what a piece is.
+    fn claimed(n: usize, helpers: usize) -> Vec<usize> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut got = Vec::new();
+        for _ in 0..helpers + 1 {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                got.push(i);
+            }
+        }
+        got.sort_unstable();
+        got
+    }
+
+    #[test]
+    fn more_helpers_claim_the_same_work() {
+        for helpers in [1, 3, 5] {
+            for n in [0, 1, 4, 33, 1000] {
+                assert_eq!(claimed(n, helpers), (0..n).collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_index_tests {
+    use super::*;
+
+    /// The exact old scan: `pending.iter().filter(..)`, in insertion order.
+    fn old_overlapping(ranges: &[(usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
+        ranges.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
+    }
+
+    fn check_queries(p: &mut Pending, ranges: &[(usize, usize)], from: usize, to: usize) {
+        let old = old_overlapping(ranges, from, to);
+        assert_eq!(p.any_overlap(from, to, false), !old.is_empty());
+        assert_eq!(p.any_overlap(from, to, true), !old.is_empty());
+        assert_eq!(p.overlapping(from, to, false), old);
+        let indexed = p.overlapping(from, to, true);
+        assert_eq!(indexed, old);
+        // The byte sets passed to `update_free`/`copy` are the same, not just
+        // the overlap booleans.
+        assert_eq!(outside(from, to, old), outside(from, to, indexed));
+    }
+
+    #[test]
+    fn indexed_pending_queries_match_the_old_scan() {
+        let mut p = Pending::default();
+        let mut ranges = Vec::new();
+        for r in [
+            (10, 50),
+            (10, 50), // duplicate declaration
+            (0, 10),  // touching
+            (49, 51), // nested overlap
+            (51, 60),
+            (60, 60), // empty range
+            (20, 20),
+        ] {
+            p.push(r);
+            ranges.push(r);
+        }
+        for from in 0..70 {
+            for to in 0..70 {
+                check_queries(&mut p, &ranges, from, to);
+            }
+        }
+        for r in ranges.iter().copied().chain(std::iter::once((9999, 9999))) {
+            assert_eq!(p.contains_exact(r, false), ranges.contains(&r));
+            assert_eq!(p.contains_exact(r, true), ranges.contains(&r));
+        }
+    }
+
+    #[test]
+    fn indexed_pending_answers_follow_every_push_and_retain() {
+        let mut state = 0x1234_5678_u64;
+        let next = |state: &mut u64| {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state >> 32
+        };
+        let mut p = Pending::default();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+        for round in 0..240 {
+            // Mix indexed and unindexed mutations: an unindexed mutation must
+            // invalidate, and the next indexed query must rebuild correctly.
+            let enabled = round % 3 != 0;
+            if round % 11 == 3 && !ranges.is_empty() {
+                let i = (next(&mut state) as usize) % ranges.len();
+                let r = ranges[i];
+                p.retain(enabled, |x| *x != r);
+                ranges.retain(|x| *x != r);
+            } else {
+                let a = (next(&mut state) % 80) as usize;
+                let e = a + (next(&mut state) % 40) as usize;
+                let r = (a, e);
+                p.push(r);
+                ranges.push(r);
+            }
+
+            for from in 0..90 {
+                for to in 0..90 {
+                    check_queries(&mut p, &ranges, from, to);
+                }
+            }
+            for r in ranges.iter().copied().chain(std::iter::once((9999, 9999))) {
+                assert_eq!(p.contains_exact(r, false), ranges.contains(&r));
+                assert_eq!(p.contains_exact(r, true), ranges.contains(&r));
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_ranges_keep_the_old_order() {
+        let mut p = Pending::default();
+        let ranges = [(30, 100), (0, 60), (55, 120), (60, 60), (20, 40)];
+        for &r in &ranges {
+            p.push(r);
+        }
+        let clipped = |from: usize, to: usize| {
+            old_overlapping(&ranges, from, to)
+                .into_iter()
+                .map(|(a, e)| (a.max(from), e.min(to)))
+                .collect::<Vec<_>>()
+        };
+        for from in 0..120 {
+            for to in 0..120 {
+                let got = p
+                    .overlapping(from, to, true)
+                    .into_iter()
+                    .map(|(a, e)| (a.max(from), e.min(to)))
+                    .collect::<Vec<_>>();
+                assert_eq!(got, clipped(from, to));
+            }
+        }
+    }
 }

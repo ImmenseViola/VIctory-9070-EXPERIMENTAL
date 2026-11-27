@@ -181,6 +181,12 @@ fn sync_on() -> bool {
 /// them (what a draw reads through a table it made itself, when recorded).
 #[cfg(windows)]
 fn sync_aside() -> bool {
+    // `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_ASIDE` compares the thread against
+    // doing the round in the submitting thread; the env default is unchanged.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_ASIDE") {
+        return sync_on() && on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
 }
@@ -192,11 +198,19 @@ fn sync_aside() -> bool {
 /// leaves it those written since.
 #[cfg(windows)]
 fn sync_early() -> Option<std::time::Duration> {
-    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
+    // `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_EARLY` turns the early rounds off in
+    // alternate phases: a submission's round can then start at once instead of
+    // queuing behind one the sync thread began on its own. The interval itself
+    // stays cached; only the on/off state follows the phases.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::ab::pick("VICTORY_HEAP_SYNC_EARLY") == Some(false) {
+        return None;
+    }
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64)
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
 /// The thread's work: rounds asked for, rounds done.
@@ -268,6 +282,79 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (one that began after what it waits
+/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// been. 0: as [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that
+/// begins after this call, asked for if none is waiting to begin (at the
+/// title's submit: the round runs while the submission waits in the line).
+/// 0 if the records are not synced by a thread of their own (or it has not
+/// started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
 }
 
 #[cfg(windows)]
@@ -1113,11 +1200,21 @@ fn constant_of(i: u32, generation: u32) -> View {
 
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    // Words 1 and 13 of a placed resource's description are stack filler,
+    // not part of what the texture is. `texture_at` already leaves them out
+    // of its key; do the same here, or each filler variant adds a shape that
+    // can never be reused (hundreds of thousands of them in a long run).
+    static FILLER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut resource = *resource;
+    if !*FILLER.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1911,16 +2008,21 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
+        // A resource description and a view no other test uses. Words 1 and
+        // 13 are stack filler, left out of the shape as they are out of a
+        // placed texture's key (`resource::texture_at`).
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut shape_resource = resource;
+        shape_resource[1] = 0;
+        shape_resource[13] = 0;
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == shape_resource || *r == resource,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == shape_resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -1928,15 +2030,24 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(View::Placed(false, shape_resource, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // A view whose resource differs only in the filler words is the
+        // same shape, as it is the same texture to `resource::texture_at`.
+        let mut filler_twin = resource;
+        filler_twin[1] ^= 0xdead_beef;
+        filler_twin[13] ^= 0xfeed_face;
+        create_placed_srv(null, &filler_twin, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(false, shape_resource, desc)));
+        assert_eq!(shapes(), 1, "filler words add no shape");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(true, shape_resource, desc)));
         assert_eq!(shapes(), 2);
-        // Placed memory past 1 TiB (not title memory) is a table entry.
+        // Placed memory past 1 TiB (not title memory) is a table entry,
+        // which keeps the view as the title wrote it.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(false, resource, desc)));

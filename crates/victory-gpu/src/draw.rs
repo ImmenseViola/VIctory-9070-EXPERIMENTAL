@@ -206,6 +206,69 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether the pass that uploads textures picked by index reads a slot's heap
+/// handle and raw descriptor view once, rather than on every look at that
+/// slot. On by default; `VICTORY_TEX_VIEW_CACHE=0` restores the old
+/// read-every-time behaviour. A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_TEX_VIEW_CACHE`.
+fn tex_view_cache() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_TEX_VIEW_CACHE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEX_VIEW_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// The two reads `heap_textures` makes of a slot, kept apart from the pass so
+/// a unit test can drive `VICTORY_TEX_VIEW_CACHE` on and off over a recorded
+/// heap and compare what each path sees.
+trait SlotHeap {
+    fn handle(&self, index: u32) -> Option<u64>;
+    fn view(&self, handle: u64) -> Option<View>;
+}
+
+impl SlotHeap for crate::descriptor::Heap {
+    fn handle(&self, index: u32) -> Option<u64> {
+        crate::descriptor::Heap::handle(self, index)
+    }
+    fn view(&self, handle: u64) -> Option<View> {
+        crate::descriptor::view(handle)
+    }
+}
+
+/// One slot's handle and raw view. With `cache` off this makes exactly the
+/// old reads at the old call sites; with it on, one read of each is reused.
+struct SlotViews<'a, H: SlotHeap + ?Sized> {
+    index: u32,
+    heap: &'a H,
+    cache: bool,
+    handle: std::cell::OnceCell<Option<u64>>,
+    view: std::cell::OnceCell<Option<View>>,
+}
+
+impl<'a, H: SlotHeap + ?Sized> SlotViews<'a, H> {
+    fn new(index: u32, heap: &'a H, cache: bool) -> Self {
+        Self { index, heap, cache, handle: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() }
+    }
+
+    fn handle(&self) -> Option<u64> {
+        if !self.cache {
+            self.heap.handle(self.index)
+        } else {
+            *self.handle.get_or_init(|| self.heap.handle(self.index))
+        }
+    }
+
+    fn raw_view(&self) -> Option<View> {
+        if !self.cache {
+            self.heap.handle(self.index).and_then(|handle| self.heap.view(handle))
+        } else {
+            self.view.get_or_init(|| self.handle().and_then(|handle| self.heap.view(handle))).clone()
+        }
+    }
+}
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2403,12 +2466,18 @@ impl State {
         };
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
+        let view_cache = tex_view_cache();
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
             }
+            // One read of the slot's handle and raw view when the cache is on;
+            // exactly the old reads at the old call sites when it is off.
+            let views = SlotViews::new(index, heap, view_cache);
+            let handle = || views.handle();
+            let raw_view = || views.raw_view();
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2453,7 +2522,7 @@ impl State {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
-                    let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
+                    let first = raw_view().map_or(0, |view| match view {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
@@ -2472,7 +2541,7 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) = raw_view() {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
@@ -2502,7 +2571,7 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) = raw_view()
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -2524,7 +2593,7 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                    && handle().is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
@@ -2560,18 +2629,20 @@ impl State {
             // the new one shows has run.
             let shows_other = !baking
                 && crate::resource::held_only()
-                && heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle));
+                && handle().is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !shows_other
                 && !baking
                 && crate::descriptor::host::show_after()
-                && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-            });
+                && handle().is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let view = if shows_other || late {
+                raw_view()
+            } else {
+                handle().and_then(|handle| host.mirror(index, handle, true))
+            };
             let at_once = || {
-                if late && let Some(handle) = heap.handle(index) {
+                if late && let Some(handle) = handle() {
                     let _ = host.mirror(index, handle, true);
                 }
             };
@@ -2604,12 +2675,12 @@ impl State {
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
-                if shows_other && let Some(handle) = heap.handle(index) {
+                if shows_other && let Some(handle) = handle() {
                     let _ = host.mirror(index, handle, true);
                 }
                 // Its bytes are in, or on the way there in a list before.
                 if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                    if let Some(handle) = heap.handle(index) {
+                    if let Some(handle) = handle() {
                         host.texture_slot_show_after(list, index, handle);
                     }
                 } else {
@@ -2636,7 +2707,7 @@ impl State {
             if let Some(ahead) = &ahead {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
-                if let Some(handle) = heap.handle(index) {
+                if let Some(handle) = handle() {
                     host.texture_slot_show_ahead(job, index, handle);
                 }
                 if let Taken::New(job) = ahead {
@@ -2667,10 +2738,10 @@ impl State {
                 note(if waited { Kind::Waited } else { Kind::Ready }, since);
                 note(Kind::Noticed, away);
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
+            if shows_other && let Some(handle) = handle() {
                 host.texture_slot_flip(list, index, handle);
             }
-            if late && let Some(handle) = heap.handle(index) {
+            if late && let Some(handle) = handle() {
                 host.texture_slot_show_after(list, index, handle);
             }
             #[cfg(feature = "diagnostics")]
@@ -4757,5 +4828,118 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+/// On/off comparisons for the read side of `heap_textures`. The pass itself
+/// needs a device and a title heap; these tests drive the same `SlotViews`
+/// helper with a recorded heap instead, so CI can check that the cache only
+/// changes how often a slot is read, not what a stable slot shows.
+#[cfg(test)]
+mod slot_view_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    use super::{SlotHeap, SlotViews};
+    use crate::descriptor::View;
+
+    struct RecordedHeap {
+        handle: Option<u64>,
+        views: RefCell<VecDeque<Option<View>>>,
+        handle_reads: Cell<u32>,
+        view_reads: Cell<u32>,
+    }
+
+    impl RecordedHeap {
+        fn new(handle: Option<u64>, reads: usize, view: Option<View>) -> Self {
+            Self {
+                handle,
+                views: RefCell::new((0..reads).map(|_| view.clone()).collect()),
+                handle_reads: Cell::new(0),
+                view_reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl SlotHeap for RecordedHeap {
+        fn handle(&self, _: u32) -> Option<u64> {
+            self.handle_reads.set(self.handle_reads.get() + 1);
+            self.handle
+        }
+        fn view(&self, _: u64) -> Option<View> {
+            self.view_reads.set(self.view_reads.get() + 1);
+            self.views.borrow_mut().pop_front().flatten()
+        }
+    }
+
+    fn drive(cache: bool, heap: &RecordedHeap, reads: usize) -> (Vec<Option<u64>>, Vec<Option<View>>) {
+        let views = SlotViews::new(7, heap, cache);
+        let mut handles = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..reads {
+            handles.push(views.handle());
+            seen.push(views.raw_view());
+        }
+        (handles, seen)
+    }
+
+    #[test]
+    fn cache_reads_each_slot_field_once() {
+        const READS: usize = 12;
+        let heap = RecordedHeap::new(Some(0x1234), READS, Some(View::Shader(1, None)));
+        drive(true, &heap, READS);
+        assert_eq!(heap.handle_reads.get(), 1);
+        assert_eq!(heap.view_reads.get(), 1);
+
+        let heap = RecordedHeap::new(Some(0x1234), READS, Some(View::Shader(1, None)));
+        drive(false, &heap, READS);
+        assert_eq!(heap.handle_reads.get(), 2 * READS as u32);
+        assert_eq!(heap.view_reads.get(), READS as u32);
+    }
+
+    #[test]
+    fn cache_and_old_path_see_the_same_stable_slot() {
+        const READS: usize = 12;
+        let views: Vec<Option<View>> = vec![
+            None,
+            Some(View::Constant(0x1000, 256)),
+            Some(View::Shader(1, None)),
+            Some(View::Unordered(2, 0, None)),
+            Some(View::Sampler([0; 13])),
+            Some(View::ConsoleSampler([0; 27])),
+            Some(View::Placed(true, [0; 14], [0; 16])),
+            Some(View::Placed(false, [0; 14], [0; 16])),
+        ];
+        for (n, view) in views.into_iter().enumerate() {
+            for handle in [None, Some(0x1234)] {
+                let off = RecordedHeap::new(handle, READS, view.clone());
+                let on = RecordedHeap::new(handle, READS, view.clone());
+                assert_eq!(drive(false, &off, READS), drive(true, &on, READS), "view {n}, handle {handle:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cache_keeps_the_first_view_if_the_title_rewrites_a_slot_mid_pass() {
+        // The known limit of the cache: the old path sees a descriptor the
+        // title writes after the first look; the cached path does not.
+        let mut views = VecDeque::new();
+        views.push_back(Some(View::Placed(false, [0; 14], [0; 16])));
+        for _ in 0..11 {
+            views.push_back(Some(View::Shader(1, None)));
+        }
+        let make = || RecordedHeap {
+            handle: Some(0x1234),
+            views: RefCell::new(views.clone()),
+            handle_reads: Cell::new(0),
+            view_reads: Cell::new(0),
+        };
+        let off = make();
+        let on = make();
+        let (_, off_views) = drive(false, &off, 12);
+        let (_, on_views) = drive(true, &on, 12);
+        assert_eq!(off_views[0], on_views[0]);
+        assert_ne!(off_views[1], on_views[1]);
+        assert!(on_views.iter().all(|v| v == &on_views[0]));
     }
 }

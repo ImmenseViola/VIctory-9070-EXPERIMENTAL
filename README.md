@@ -122,11 +122,32 @@ XCL's global wave64 split was deliberately not ported: it was a compile-hang
 workaround and can be 1.3x to 5x slower. Rayon was not added; the target
 already has a persistent `wide*` worker pool.
 
+### Playability cuts on by default
+
+Four measured cuts are on by default in this tree. Each keeps its own
+`=0` escape hatch, so the old behaviour can be restored without rebuilding:
+
+| Switch | Default | What it does |
+|---|---|---|
+| `VICTORY_HEAP_SYNC_SAFE` | **on** | Asks for a real heap-sync round at the title's submit and carries its mark through the submitting lane, without port #7's journal sharding |
+| `VICTORY_WIDE_REFRESH_MORE` | **on** | Uses up to six kept helpers for wide refresh work; idle helpers cost no CPU while off. `VICTORY_WIDE_THREADS_MAX=3` restores the old ceiling |
+| `VICTORY_PENDING_INDEX` | **on** | Adds an advisory index over pending shader-write ranges; the insertion-ordered vector stays authoritative, so copied bytes and order are unchanged |
+| `VICTORY_TEX_VIEW_CACHE` | **on** | Reads a texture slot's heap handle and raw view once per pass instead of on every look at that slot |
+
+The combined fixed-view A/B over six matched pairs measured **−2.61 ms mean**
+per frame, with matched draw counts and no change in private or video memory.
+The visual check found nothing new. None of these cuts enable ray tracing or
+change the title's draw order.
+
 ## Known problems
 
 - Trees and grass still shimmer/flicker, including in the boat scene. One piece
-  of vegetation rendered neon green in the playthrough. The skinning fix did
-  not touch vegetation.
+  of vegetation rendered neon green in the playthrough, and some trees show red
+  leaves. Both are present in the stable branch too and are known, deferred
+  issues. The skinning fix did not touch vegetation.
+- Triangling/popping on trees and transparent objects, transparent-object
+  shadows, fences, and broken puddles/swamps are also known and present in the
+  stable branch. Ray tracing is not active.
 - Glass sometimes renders black. Sunglasses and eyes can look blueish, as if a
   reflection pass were wrong.
 - In dialogue, face textures and beards moved but the model's lips did not in
@@ -147,6 +168,12 @@ already has a persistent `wide*` worker pool.
   shaders and pipelines are made. Warm both caches before measuring.
 - With 32 GB of system RAM, long XCL-style sessions can lose speed late in a
   run; 64 GB is safer for long tests.
+- With a cold shader/pipeline cache, world entry can stall on a black
+  `Americas` screen at 1 draw/frame while translation continues, and the title's
+  own timeout/watchdog can then end the session. This is a cold-cache trap, not
+  a performance regression. Warm both caches first (`translate --warm all` and
+  `warm --used`), then use the launcher's Enter-only menu schedule to get into
+  the world; avoid movement or camera keys while waiting.
 - Recording a frame in the world makes the title's own watchdog end it.
 
 ## How to run it
@@ -223,7 +250,8 @@ The tuned renderer patches are off by default as upstream exposes them:
 
 Other useful tuned switches are `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_LATE_WAIT=1`,
 `VICTORY_THIN=1`, `VICTORY_RELAY=1`/`2`, `VICTORY_UPSCALER=6`,
-`VICTORY_RESIDENCY=1`, and the `VICTORY_HEAP_*`, `VICTORY_CARD_*`,
+`VICTORY_RESIDENCY=1`, and the `VICTORY_HEAP_SYNC`,
+`VICTORY_HEAP_PASS_ASIDE`, `VICTORY_CARD_BUFFERS`, `VICTORY_CARD_STEPS`,
 `VICTORY_PIPELINE_WAIT_SHARED`, `VICTORY_WIDE_REFRESH` and
 `VICTORY_LIGHT_REFRESH` settings from [docs/findings.md](docs/findings.md).
 

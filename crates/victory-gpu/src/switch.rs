@@ -15,6 +15,13 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a cut is on unless the run explicitly turns it off with `NAME=0`.
+/// Readers that take part in a `VICTORY_AB` phase ask `crate::ab` first; this
+/// is the plain default for normal runs and non-diagnostics builds.
+pub(crate) fn default_on(name: &str) -> bool {
+    value_is_on(std::env::var_os(name).as_deref())
+}
+
 /// A switch that is on unless its variable is `0`, read once; with
 /// `VICTORY_AB` naming it (diagnostics builds, `crate::ab`), on and off while
 /// the title runs.
