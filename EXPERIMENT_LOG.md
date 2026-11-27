@@ -457,3 +457,75 @@ shows tuned `main` at `5194620` and no stray branch. The commit was then pushed
 to the `experimental` remote, whose `main` and `experimental/texture-pass-aside`
 both point at `7c78e2a`. Future pushes must name the `experimental` remote
 explicitly.
+
+## Cut 1a game A/B started (2026-11-27)
+
+`cut1a-fine-1` launched with the warmed version-3 cache, `series-s`, upscaler
+`6`, Enter-only schedule, `VICTORY_AB=20,VICTORY_REFRESH_FINE_JOBS`, and
+`VICTORY_COPY_STAGES=1` for stage attribution. First monitor and stopper were
+started with a 120 s harness timeout and were terminated by that timeout while
+shader translation was still active; the game itself stayed alive. They were
+restarted with a 900 s timeout, a 120 s monitor warmup, and cycle ends
+`7,15,23,31` so that a clean post-startup cycle can be used. No result or
+label yet; the game is still translating shaders and showing 1 draw/frame.
+
+Cut 1c was investigated read-only and is parked: there are no adjacent
+production refresh-flush sites with no title write, `flush_one`, `Step::Run`,
+non-free `Step::Placed`, texture-due change, or `ask_once_end` between them.
+The only adjacent flush calls are in the test helper
+`refresh_tests::submission`, so a game-facing switch would be dead code. No
+Cut 1c switch or test was added; the order moves to Cut 2.
+
+The `cut1a-fine-1` monitor finished twelve samples, all at 1 draw/frame, mean
+luma `7.9`, non-black `5.1–5.2%`, private `6.76–7.11 GB`: the game was still
+at the menu/loading screen because shader translation continued past the
+scripted Enter presses. Manual Enter attempts while translation was active
+did not change the draw count. The first replacement stopper was stopped
+before its deadline; `tools/stop-after-clean-ab.ps1` was then hardened so a
+deadline reached while shader translation is active extends to a hard
+deadline and never kills a busy game. A new `tools/enter-when-quiet.ps1` helper
+waits for a quiet translation window and sends Enter then; both are running
+for this same A/B attempt. No result or label yet.
+
+## Cut 1a game A/B result — crash / confounded, switch stays off (2026-11-27)
+
+The quiet-window Enter helper fired at `02:43:46+02:00` and sent three Enters,
+but the run never reached active gameplay: every parsed phase reported
+`1 draw/frame`, the title stayed on the menu/loading presentation, and shader
+translation continued through most of the run. At `00:47:03Z` the title logged
+a first-chance `0xc0000005` write to address 0 in
+`victory-image-b99f876b74d4a77f.dll+0x2215c35`; at `00:47:51Z` it became an
+unhandled exception with the same stack, followed by Breakpad crash context
+`t:\victory-20261127-024825-4648.crash.log` and minidump
+`T:\caa50b27-8899-4d03-93e7-f0266d058e6a.dmp`. The process exited after phase
+91; the stopper recorded `STOP_REASON=exited` and did not kill it.
+
+Phases 80–91 were parsed for the final attempt (full output saved as
+`C:\mygame\victory-work\cut1a-fine-1-full-report.txt`):
+
+- off: 2143 frames across 6 phases, mean of means `70.77 ms`, mean of medians
+  `33.32 ms`, max p90 `33.8 ms`, `1` draw/frame; on (`VICTORY_REFRESH_FINE_JOBS`):
+  2631 frames across 6 phases, mean of means `6267.95 ms`, mean of medians
+  `6256.9 ms`, max p90 `37374.9 ms`, `1` draw/frame.
+- matched off→on pairs: `80→81` `+0.0 ms`, `82→83` `+0.0 ms`, `84→85`
+  `+1.6 ms`, `86→87` `+37326.8 ms` (on side 1 frame, 0 draws), `88→89`
+  `-69.3 ms`, `90→91` `-76.0 ms`; medians were `0`, `0`, `0`, `+37341.6`,
+  `-0.1`, `0`; p90 deltas `0`, `0`, `0`, `+37341.3`, `-0.1`, `-0.2`; draw
+  ratios `1` except `0.833` for the crash pair.
+- visual/memory: the monitor had finished its 12 samples before the later
+  phases, so all samples are on the off side: mean luma `7.9`, non-black
+  `5.1–5.2%`, private `6.76–7.11 GB`, changed `0–0.1%`. There is no on-side
+  luma/non-black sample, so the visual comparison is unavailable; the run was
+  not a gameplay cycle.
+- stages in parsed phases: refresh recording `0.05–0.51 ms`, refresh worker
+  stage `0.05–0.51 ms` with `0.00 ms` summed worker CPU and 0 worker jobs,
+  critical-path lists `0.1–0.7 ms` in `13–91` flushes, sending `0.4–3.3 ms`,
+  ask/gather/sweep near zero, heap waits `0.1–2.68 ms`; the last diagnostic
+  frames had `33.1–33.2 ms` in title work/elsewhere. These are not gameplay
+  numbers.
+
+Final label: **confounded** from the full-report rule (mean delta on-off
+`6197.18 ms`, p90 max delta `37341.1 ms`, draw ratio `0.833`), with an
+additional title crash during phase 87. Per the run rule, there is no retry:
+`VICTORY_REFRESH_FINE_JOBS` remains off by default and Cut 1a is not a win.
+The game is fully closed.

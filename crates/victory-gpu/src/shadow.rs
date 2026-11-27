@@ -1531,11 +1531,11 @@ fn max_wide_threads() -> usize {
 /// so the pool must already hold the extra idle threads.
 fn active_wide_threads() -> usize {
     let default = wide_threads();
-    let default = || default;
     let more = experiment("VICTORY_WIDE_REFRESH_MORE", || {
-        std::env::var_os("VICTORY_WIDE_REFRESH_MORE").is_some_and(|v| v == "1")
+        static MORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MORE.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH_MORE").is_some_and(|v| v == "1"))
     });
-    if more { max_wide_threads() } else { default() }
+    if more { max_wide_threads() } else { default }
 }
 
 /// Shared experiment reader for the shadow wide path.

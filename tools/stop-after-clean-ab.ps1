@@ -10,6 +10,7 @@ param(
 $root = 'C:\mygame\victory-work'
 $log = Join-Path $root "$Tag-stderr.txt"
 $deadline = (Get-Date).AddMinutes($MaxMinutes)
+$hardDeadline = $deadline.AddMinutes(15)
 $reason = 'timeout'
 
 function Get-PhaseDraws {
@@ -33,11 +34,15 @@ function TranslationBusy {
     return $false
 }
 
-while ((Get-Date) -lt $deadline) {
+while ((Get-Date) -lt $hardDeadline) {
     $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
     if (-not $p -or $p.HasExited) { $reason = 'exited'; break }
 
     $busy = TranslationBusy
+    if ((Get-Date) -ge $deadline -and $busy) {
+        Start-Sleep -Seconds 10
+        continue
+    }
     $private = $p.PrivateMemorySize64 / 1GB
     if ($private -gt $PrivateLimitGb -and -not $busy) { $reason = "private ${private:N2} GB"; break }
 
@@ -53,7 +58,8 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 10
 }
 
+if ($busy -and $reason -eq 'timeout') { $reason = 'busy at hard deadline' }
 "STOP_REASON=$reason"
-if ($reason -ne 'exited') {
+if ($reason -ne 'exited' -and -not $busy) {
     taskkill /PID $TargetPid /F /T
 }
