@@ -40,6 +40,9 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | Switch | Default here | A/B name | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win (mostly mean/p90, median only 1–3 ms); user visual check done, no cache-specific artifact seen |
+| `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a implemented, awaiting A/B |
+| `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b implemented, awaiting A/B |
+| `VICTORY_WIDE_THREADS_MAX` | off (default helper count) | — | Fixed pool ceiling for cut 1b, not an A/B switch on its own |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -77,6 +80,27 @@ handle and one view; another records the known difference when the title
 rewrites the descriptor mid-pass. This runs in CI, no device or game session
 needed. It covers read changes only: a switch that also skips side effects needs
 a separate host-side harness and stays blocked.
+
+### Cut 1a: `VICTORY_REFRESH_FINE_JOBS`
+
+`host::fine_spans` cuts a refresh span into at most four jobs, never below
+`256 KiB` a job, before the wide dispatch in `refresh_spans`, `refresh_ahead`,
+and `flush_all`. It changes only which worker claims which bytes: the byte
+union, span order, `ahead` marking, ask windows, and title-write boundaries are
+unchanged. Off by default; named in `VICTORY_AB`, the phase decides it at every
+present. `host.rs::tests::fine_refresh_jobs_have_the_same_bytes_in_the_same_order`
+asserts identical bytes and order, including empty and short spans.
+
+### Cut 1b: `VICTORY_WIDE_REFRESH_MORE`
+
+`shadow::wide_threads()` still keeps three helpers on this machine. A fixed
+`VICTORY_WIDE_THREADS_MAX` ceiling (default: the usual count) keeps extra idle
+helpers alive; `VICTORY_WIDE_REFRESH_MORE=1` wakes them for each wide dispatch.
+The atomic index counter still hands every number to exactly one claimer, so
+only who does a piece changes. Off by default and A/B-able. Extra helpers wait
+without spinning while off, and a raise wakes them before jobs are queued.
+`shadow.rs::more_wide_tests::more_helpers_claim_the_same_work` asserts identical
+index coverage for three, seven, and nine claimers.
 
 ## Game A/B protocol
 
@@ -191,8 +215,9 @@ supply the ~15 ms needed for 30 fps, so the order is:
 7. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.
 
-No optimisation code has been written from the diagnostics; the user must
-choose a cut before implementation.
+Cuts 1a and 1b are implemented off by default and awaiting their own A/B runs.
+Nothing is promoted to a default without a clean run and the user's visual
+check.
 
 Parallel filtering of live descriptor/title state is parked; it would change
 which bytes upload.

@@ -107,6 +107,16 @@ enum Retired {
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
+/// An experiment's switch, read every time so `VICTORY_AB` can turn it at a
+/// present. Off by default unless its own variable opts in.
+fn experiment(name: &str, default: impl FnOnce() -> bool) -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::switched(name) {
+        return on;
+    }
+    default()
+}
+
 /// Milliseconds since the first call.
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -1172,6 +1182,28 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Cut 1a: finer refresh jobs cover exactly the old bytes, in the old
+    /// span order, and never invent or drop a byte at a piece boundary.
+    #[test]
+    fn fine_refresh_jobs_have_the_same_bytes_in_the_same_order() {
+        let spans = vec![(0u8, 0usize, 10usize), (1, 10, 30), (2, 30, 30), (3, 30, super::FINE_JOB_BYTES * 3)];
+        assert_eq!(super::fine_spans(spans.clone(), 1), spans);
+        let fine = super::fine_spans(spans.clone(), 4);
+        for (key, from, to) in &fine {
+            assert!(*from <= *to && *to <= spans[*key as usize].2);
+        }
+        for (key, from, to) in spans {
+            let parts: Vec<_> = fine.iter().filter(|(k, _, _)| *k == key).cloned().collect();
+            assert_eq!(parts.first().map(|p| p.1), Some(from));
+            assert_eq!(parts.last().map(|p| p.2), Some(to));
+            for pair in parts.windows(2) {
+                assert_eq!(pair[0].2, pair[1].1);
+            }
+            assert!(parts.len() <= 4);
+        }
+        assert_eq!(fine.iter().map(|(_, f, t)| t - f).sum::<usize>(), 30 + super::FINE_JOB_BYTES * 3 - 30);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -7951,6 +7983,44 @@ fn flush_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     crate::shadow::wide_each(n, work);
 }
 
+/// Cut 1a: split each refresh span into more jobs, but never below this many
+/// bytes a job (the queue costs more than the copy below it).
+const FINE_JOB_BYTES: usize = 256 << 10;
+
+/// How many pieces a refresh span gives with `VICTORY_REFRESH_FINE_JOBS=1`.
+/// The switch is A/B-able; off by default.
+fn fine_job_factor() -> usize {
+    let default = || {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_FINE_JOBS").is_some_and(|v| v == "1"))
+    };
+    if experiment("VICTORY_REFRESH_FINE_JOBS", default) { 4 } else { 1 }
+}
+
+/// The byte-for-byte union of `spans`, in the same order, with each span cut
+/// into at most `factor` pieces and no piece below [`FINE_JOB_BYTES`] unless
+/// the span itself is smaller. `factor == 1` returns the spans untouched.
+fn fine_spans<T: Clone>(spans: Vec<(T, usize, usize)>, factor: usize) -> Vec<(T, usize, usize)> {
+    if factor <= 1 {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len() * factor);
+    for (shadow, from, to) in spans {
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            out.push((shadow, from, to));
+            continue;
+        }
+        let pieces = len.div_ceil(FINE_JOB_BYTES).clamp(1, factor);
+        let step = len.div_ceil(pieces);
+        for i in 0..pieces {
+            let at = from + i * step;
+            out.push((shadow.clone(), at, (at + step).min(to)));
+        }
+    }
+    out
+}
+
 /// A `nothing_new` decision, timed only when the fine breakdown is asked for.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn known_nothing(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, site: usize) -> bool {
@@ -8913,6 +8983,10 @@ impl Batch {
                 FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
             }
         }
+        let factor = fine_job_factor();
+        if factor > 1 {
+            spans = fine_spans(spans, factor);
+        }
         let ahead = spans.len() > 1;
         if ahead {
             #[cfg(feature = "diagnostics")]
@@ -8997,6 +9071,8 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        let factor = fine_job_factor();
+        let due = if factor > 1 { fine_spans(due, factor) } else { due };
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
@@ -9137,11 +9213,16 @@ impl Batch {
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            let factor = fine_job_factor();
+            let refreshes = if factor > 1 {
+                fine_spans(std::mem::take(&mut self.refreshes), factor)
+            } else {
+                std::mem::take(&mut self.refreshes)
+            };
             #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+            FLUSHES[3].fetch_add(refreshes.len() as u64, Ordering::Relaxed);
             if light {
                 // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
                 flush_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     #[cfg(feature = "diagnostics")]
@@ -9156,9 +9237,8 @@ impl Batch {
                     Self::update(shadow, *from, *to);
                 });
             } else {
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .refreshes
-                    .drain(..)
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
+                    .into_iter()
                     .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                     .collect();
                 crate::shadow::wide_run(jobs);

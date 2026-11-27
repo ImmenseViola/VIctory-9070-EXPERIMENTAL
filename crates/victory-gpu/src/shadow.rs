@@ -1464,6 +1464,11 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Index of the first helper that must stand down for this dispatch. Helpers
+/// above it wait without spinning, so raising the pool costs no CPU while the
+/// switch is off.
+static ACTIVE_WIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
@@ -1471,6 +1476,18 @@ struct Workers {
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
+}
+
+static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+
+/// Put the extra helpers on call before a dispatch that needs them. They wait
+/// without spinning while off, so a raise must wake them; a drop needs no
+/// wake, they see it on their next loop.
+fn set_active_wide(active: usize, workers: &Workers) {
+    let before = ACTIVE_WIDE.swap(active, Ordering::AcqRel);
+    if active > before {
+        workers.more.notify_all();
+    }
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
@@ -1490,13 +1507,47 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// The usual number of helper threads kept for [`wide`], leaving most of the
+/// title's threads alone (12 logical threads: three helpers plus the caller).
 fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// Cut 1b: more helpers can be kept alive, but are idle at the usual count.
+/// `VICTORY_WIDE_THREADS_MAX` only raises the pool a run may switch into.
+fn max_wide_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let asked = *MAX.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(wide_threads)
+    });
+    asked.clamp(wide_threads(), 16)
+}
+
+/// The helper count this call uses. `VICTORY_WIDE_REFRESH_MORE` is A/B-able;
+/// off by default. A named `VICTORY_AB` switch decides it at every dispatch,
+/// so the pool must already hold the extra idle threads.
+fn active_wide_threads() -> usize {
+    let default = wide_threads();
+    let default = || default;
+    let more = experiment("VICTORY_WIDE_REFRESH_MORE", || {
+        std::env::var_os("VICTORY_WIDE_REFRESH_MORE").is_some_and(|v| v == "1")
+    });
+    if more { max_wide_threads() } else { default() }
+}
+
+/// Shared experiment reader for the shadow wide path.
+fn experiment(name: &str, default: impl FnOnce() -> bool) -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::switched(name) {
+        return on;
+    }
+    default()
+}
+
 fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
@@ -1504,12 +1555,19 @@ fn workers() -> &'static Workers {
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        for i in 0..wide_threads() {
+        ACTIVE_WIDE.store(active_wide_threads(), Ordering::Relaxed);
+        for i in 0..max_wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    let job = {
+                    let job = if i >= ACTIVE_WIDE.load(Ordering::Relaxed) {
+                        // Spare helpers wait without spinning; this costs no
+                        // CPU while the wide-thread switch is off.
+                        let jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        let _wait = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    } else {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
@@ -1541,6 +1599,7 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
+    set_active_wide(active_wide_threads(), workers);
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
@@ -1588,7 +1647,8 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let active = active_wide_threads();
+    let threads = (active + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
@@ -1641,6 +1701,7 @@ fn wide_timed(jobs: Vec<Job>, timing: &WideTiming) {
     }
     let began = std::time::Instant::now();
     let workers = workers();
+    set_active_wide(active_wide_threads(), workers);
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
@@ -1685,7 +1746,8 @@ fn wide_timed(jobs: Vec<Job>, timing: &WideTiming) {
 pub(crate) fn wide_each_timed(n: usize, work: impl Fn(usize) + Send + Sync + 'static) -> WideEachTiming {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let active = active_wide_threads();
+    let threads = (active + 1).min(n);
     let busy: Arc<Vec<AtomicU64>> = Arc::new((0..threads).map(|_| AtomicU64::new(0)).collect());
     let jobs = (0..threads)
         .map(|worker| {
@@ -6078,4 +6140,38 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod more_wide_tests {
+    use super::*;
+
+    /// The wide path hands each number to one caller exactly once, with the
+    /// usual three helpers and with a switched-in larger pool. This is the
+    /// byte/order-equivalence guarantee behind `VICTORY_WIDE_REFRESH_MORE`:
+    /// only who claims a piece changes, never what a piece is.
+    fn claimed(n: usize, helpers: usize) -> Vec<usize> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut got = Vec::new();
+        for _ in 0..helpers + 1 {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                got.push(i);
+            }
+        }
+        got.sort_unstable();
+        got
+    }
+
+    #[test]
+    fn more_helpers_claim_the_same_work() {
+        for helpers in [1, 3, 7] {
+            for n in [0, 1, 4, 33, 1000] {
+                assert_eq!(claimed(n, helpers), (0..n).collect::<Vec<_>>());
+            }
+        }
+    }
 }

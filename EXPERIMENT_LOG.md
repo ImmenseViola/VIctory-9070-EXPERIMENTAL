@@ -426,3 +426,25 @@ No optimisation or switch default changed in these rounds.
 - Vegetation distance fade is suspected by the user to be a RAM/streaming
   ceiling rather than ordinary LOD. Parked by request until the multi-ms CPU
   work is done; no change has been made for it.
+
+## Cut 1a and 1b implemented, awaiting game A/B (2026-11-27)
+
+Both cuts are in the experimental tree, off by default, and A/B-able.
+
+- **Cut 1a — `VICTORY_REFRESH_FINE_JOBS`**: `host::fine_spans` splits each
+  refresh span into at most four jobs, no piece under `256 KiB`, in the three
+  wide refresh dispatch sites (`refresh_spans`, `refresh_ahead`, `flush_all`).
+  Byte union, span order, `ahead` marking, ask windows, and title-write
+  boundaries are untouched. Unit test:
+  `host.rs::tests::fine_refresh_jobs_have_the_same_bytes_in_the_same_order`.
+- **Cut 1b — `VICTORY_WIDE_REFRESH_MORE`**: `shadow::active_wide_threads` can
+  wake more helpers kept by a fixed `VICTORY_WIDE_THREADS_MAX` ceiling. Off
+  helpers wait without spinning; raising the count wakes them before dispatch.
+  The atomic index counter still gives every piece to exactly one claimer.
+  Unit test: `shadow.rs::more_wide_tests::more_helpers_claim_the_same_work`.
+
+Verification before push: `cargo check --workspace --all-features --locked`,
+`cargo test --workspace --all-features --locked`, `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings`, `cargo build --locked
+--profile diag -p victory --features diagnostics`, and `git diff --check` all
+passed. No game result yet; no default changed.
