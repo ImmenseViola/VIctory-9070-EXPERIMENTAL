@@ -43,7 +43,7 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a: one game run never reached gameplay and crashed; stays off |
 | `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b: first run black/idle; one retry confounded by scene mismatch; stays off |
 | `VICTORY_WIDE_THREADS_MAX` | off (default helper count) | — | Fixed pool ceiling for cut 1b, not an A/B switch on its own |
-| `VICTORY_PENDING_INDEX` | off | `VICTORY_PENDING_INDEX` | Cut 2 implemented, equivalence-tested, awaiting A/B |
+| `VICTORY_PENDING_INDEX` | off | `VICTORY_PENDING_INDEX` | Cut 2: A/B confounded and crashed with the same title-image fault as Cut 1a; stays off |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -122,7 +122,9 @@ query rebuilds from the vector whenever the index is absent or stale.
 for nested, touching, duplicate, and empty ranges, after every push and retain,
 and over dense query ranges. It asserts identical overlap booleans, identical
 insertion-order ranges after clipping, and identical byte gaps passed to the
-copy functions.
+copy functions. The one game A/B was confounded and crashed with the same
+`victory-image-b99f876b74d4a77f.dll+0x2215c35` write-to-null fault as Cut 1a, so
+the switch stays off and no retry was made.
 
 ## Game A/B protocol
 

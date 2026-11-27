@@ -669,3 +669,52 @@ Cut 2 pre-commit verification passed: `cargo check --workspace --all-features
 --features diagnostics`. The switch table and A/B protocol were then updated to
 record Cut 1b's final label and the late Enter-only entry window, so the full
 verification is being rerun once more before the commit. No default changed.
+That rerun passed every check again, including the diagnostics build. The work
+was committed as `3f6bac8` ("Add query-only pending index and finalize wide
+A/B") and pushed explicitly to the experimental remote's `main` and
+`experimental/texture-pass-aside`; both now point at `3f6bac8`. Tuned `origin
+main` was untouched at `5194620`.
+
+Cut 2 game A/B `cut2-pending-1` launched at `04:22:16+02:00` as pid `15256`
+with the warmed version-3 cache, `series-s`, upscaler `6`, the rebuilt
+diagnostics binary, `VICTORY_AB=20,VICTORY_PENDING_INDEX`,
+`VICTORY_COPY_STAGES=1`, and no other cut variable. The late Enter-only
+injected key window from the Cut 1b retry is reused as entry assistance. A
+passive visual/memory monitor and the non-killing phase stopper
+(`29.5 GB`, `MaxMinutes 45`, cycle ends `7/11/15/19/23`) are attached. No result
+or label yet.
+
+### Cut 2 game A/B result (2026-11-27) -- CONFOUNDED, crashed
+
+`cut2-pending-1` spent about 29 minutes in shader/pipeline translation before
+`11`-draw gameplay appeared in phases `87–91` (`02:51:39Z–02:52:59Z`). Phase
+`92` then logged one `45976.5 ms` frame and the game crashed at `02:53:52Z`
+(`04:53:52+02:00`); the stopper reported `STOP_REASON=exited` and no victory
+process remains. Full report:
+`C:\mygame\victory-work\cut2-pending-1-full-report.txt`.
+
+- Crash: `VIctory: first-chance exception 0xc0000005 at
+  victory-image-b99f876b74d4a77f.dll+0x2215c35 (write 0x0: nothing mapped
+  there)` followed by the same unhandled exception and a Breakpad minidump
+  (`fdb6e195-c8ef-4151-80cc-c63a6272c74d.dmp`). This is the same image/address
+  as the Cut 1a crash, so it is recorded as a shared title-side fault rather
+  than evidence for or against this cut; the protocol still forbids a retry.
+- Frames: on phases `87/89/91` were `33.3 / 33.3 / 33.6 ms` (mean of means,
+  mean of medians, max p90) over `1711` frames; off phases `88/90` were the same
+  over `1141` frames. Both matched pairs (`88->89`, `90->91`) were draws (`0 ms`
+  mean/median/p90), with `11` draws/frame on both sides (`ratio 1`).
+- Visual/memory: the monitor's 26 samples are all labelled on-side; 25 are the
+  black title (`7.9–8.0` luma, `5.1–5.2%` non-black) and only the last is
+  gameplay (`38.2` luma, `96.6%` non-black). There is no matched off-side
+  gameplay visual sample. Private memory was `6.17–7.47 GB`, nowhere near the
+  `29.5 GB` limit.
+- Stages in the usable window were small: copy recording `0.00–0.07 ms`,
+  refresh workers `0.00–0.06 ms` with `0` worker jobs, list work `0.0–0.2 ms`,
+  sends `0.7 ms`, heap waits `0.2 ms` at most, and `12` refreshes of `11.6 MB`.
+  The large active-gameplay refresh path was not exercised.
+
+Final label: **confounded with crash**. The zero frame deltas are not a win
+because the sides do not share a usable visual scene and the run ended in the
+same title-image fault seen in Cut 1a. `VICTORY_PENDING_INDEX` stays off; no
+retry was made. Unit equivalence and full verification remain valid, but no
+game evidence supports promoting the cut.
