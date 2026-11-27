@@ -2,7 +2,8 @@
 //! (`VICTORY_PORT_JOURNAL=1`, off by default; the switch is
 //! [`crate::watch::port_journal`]). Cut 3's safe early-round form
 //! (`VICTORY_HEAP_SYNC_SAFE`, off by default) reuses this module's mark/ask
-//! path without turning on port #7's journal sharding.
+//! path without turning on port #7's journal sharding. Cut 3 is on by default
+//! in this fork; `VICTORY_HEAP_SYNC_SAFE=0` restores the old form.
 //!
 //! What the lane ("victory-submit", `crate::queue`'s line) waited for most
 //! with ports 1, 2, 5 and 6 on (runs guard-4, guard-6, merge-4): the heaps'
@@ -47,8 +48,9 @@ pub(crate) fn on() -> bool {
 /// [`crate::descriptor::round_after_now`] path, and carry its mark through
 /// this module and the submitting lane. The wait point
 /// (`crate::descriptor::SyncedHeaps::drop`) and the round's completion point
-/// (`crate::descriptor`'s `Over::drop`) are unchanged. Off by default;
-/// `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_SAFE` compares it in one run.
+/// (`crate::descriptor`'s `Over::drop`) are unchanged. On by default in this
+/// fork; `VICTORY_HEAP_SYNC_SAFE=0` restores the old behaviour, and a named
+/// `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_SAFE` switch overrides both.
 pub(crate) fn safe_heap_sync() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_SAFE") {
@@ -58,8 +60,17 @@ pub(crate) fn safe_heap_sync() -> bool {
     if SAFE_HEAP_SYNC_IN_TEST.get() {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_SYNC_SAFE").is_ok_and(|v| v.trim() == "1"))
+    // Unit tests drive this switch through the thread-local above; they never
+    // inherit a developer's environment default.
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::ab::default_on("VICTORY_HEAP_SYNC_SAFE"))
+    }
 }
 
 #[cfg(test)]

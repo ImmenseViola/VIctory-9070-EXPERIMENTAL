@@ -40,11 +40,16 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | Switch | Default here | A/B name | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win (mostly mean/p90, median only 1–3 ms); user visual check done, no cache-specific artifact seen |
-| `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a: one game run never reached gameplay and crashed; stays off |
-| `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b: first run black/idle; one retry confounded by scene mismatch; stays off |
-| `VICTORY_WIDE_THREADS_MAX` | off (default helper count) | — | Fixed pool ceiling for cut 1b, not an A/B switch on its own |
-| `VICTORY_PENDING_INDEX` | off | `VICTORY_PENDING_INDEX` | Cut 2: A/B confounded and crashed with the same title-image fault as Cut 1a; stays off |
-| `VICTORY_HEAP_SYNC_SAFE` | off | `VICTORY_HEAP_SYNC_SAFE` | Cut 3: safe early heap-sync round; implemented, unit-tested, awaiting its own game A/B |
+| `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a: **dropped** after title crashes in both game runs; stays off and is not part of the next build's stack |
+| `VICTORY_WIDE_REFRESH_MORE` | **on** | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b: canonical fixed-view **no regression** (`-0.38/-0.35/-0.32 ms`, 24 pairs); enabled in frozen #2 as part of the combined stack; `=0` restores the old helper count |
+| `VICTORY_WIDE_THREADS_MAX` | **6** | — | Fixed pool ceiling for 1b, matching the canonical combined run; `=3` restores the old ceiling; not an A/B switch on its own |
+| `VICTORY_WIDE_HELPERS` | off (usual count) | — | Off-phase helper count for a scaling A/B (6 for 6-vs-8, 8 for 8-vs-10); not a switch |
+| `VICTORY_WIDE_HELPERS_8` | off | `VICTORY_WIDE_HELPERS_8` | Dropped: 25 matched pairs, `0/0.1/0.09 ms`, **no regression**; scaling past six helpers does not pay |
+| `VICTORY_WIDE_HELPERS_10` | off | `VICTORY_WIDE_HELPERS_10` | Conditional on 8 winning; not in frozen #2 |
+| `VICTORY_PENDING_INDEX` | **on** | `VICTORY_PENDING_INDEX` | Cut 2: canonical fixed-view **no regression** (`0.17/0.12/-0.25 ms`, 25 pairs); enabled in frozen #2 as part of the combined stack; `=0` restores the old scan |
+| `VICTORY_HEAP_SYNC_SAFE` | **on** | `VICTORY_HEAP_SYNC_SAFE` | Cut 3: fixed-view clean win (`-1.42/-1.22/-0.48 ms`, six pairs, draw deviation `0.3%`); enabled in frozen #2; `=0` restores the old wait |
+| `VICTORY_HEAP_SYNC_EARLY` | on (4 ms) | `VICTORY_HEAP_SYNC_EARLY` | Existing A/B: off removes self-originated early rounds; retest under the fixed view before using it |
+| `VICTORY_HEAP_SYNC_RUSH` | off | `VICTORY_HEAP_SYNC_RUSH` | Parked: small ceiling, no completed canonical A/B; unit-tested for byte/order equivalence but not in frozen #2 |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -100,17 +105,19 @@ asserts that no two jobs of one shadow touch the same 4 KiB page.
 ### Cut 1b: `VICTORY_WIDE_REFRESH_MORE`
 
 `shadow::wide_threads()` still keeps three helpers on this machine. A fixed
-`VICTORY_WIDE_THREADS_MAX` ceiling (default: the usual count) keeps extra idle
-helpers alive; `VICTORY_WIDE_REFRESH_MORE=1` wakes them for each wide dispatch.
-The atomic index counter still hands every number to exactly one claimer, so
-only who does a piece changes. Off by default and A/B-able. Extra helpers wait
-without spinning while off, and a raise wakes them before jobs are queued.
+`VICTORY_WIDE_THREADS_MAX` ceiling (default: six in this fork, matching the
+canonical combined run) keeps three extra idle helpers alive;
+`VICTORY_WIDE_REFRESH_MORE` wakes them for each wide dispatch. The atomic index
+counter still hands every number to exactly one claimer, so only who does a
+piece changes. The switch is **on by default in this fork** and remains A/B-able
+and reversible with `VICTORY_WIDE_REFRESH_MORE=0`; a named `VICTORY_AB` switch
+overrides both. Extra helpers wait without spinning while off, and a raise wakes
+them before jobs are queued.
 `shadow.rs::more_wide_tests::more_helpers_claim_the_same_work` asserts identical
-index coverage for three, seven, and nine claimers. Both game A/Bs were
-confounded: the first never left the black title screen, and the one allowed
-retry reached gameplay only on the on side's visual samples (off-side luma gap
-`28.3`, non-black gap `85.6` points) despite all frame deltas being draws. No
-further retry is allowed and the switch stays off.
+index coverage for three, seven, and nine claimers. The canonical fixed-view run
+was **no regression** (`-0.38/-0.35/-0.32 ms`, 24 pairs); the combined stack with
+Cut 3 and Cut 2 was a clean win. The user accepted playability as the goal and
+deferred visuals, so 1b is enabled in frozen binary #2.
 
 ### Cut 2: `VICTORY_PENDING_INDEX`
 
@@ -120,20 +127,22 @@ the overlap questions previously answered by linear scans. It is used by
 `send_copied`, `writing`, `copy_back_done`, `writes_pending_in`,
 `stale_under_writes`, `merge_under_writes`, `update`, and `nothing_new`. It does
 not touch `Batch.ahead`, submission ordering, ask windows, or title-write
-boundaries, and it has no cached skip decision. Off by default and A/B-able; a
-query rebuilds from the vector whenever the index is absent or stale.
+boundaries, and it has no cached skip decision. It is **on by default in this
+fork**, remains A/B-able, and `VICTORY_PENDING_INDEX=0` restores the old scans;
+a query rebuilds from the vector whenever the index is absent or stale.
 
 `shadow.rs::pending_index_tests` compares indexed answers with the old scans
 for nested, touching, duplicate, and empty ranges, after every push and retain,
 and over dense query ranges. It asserts identical overlap booleans, identical
 insertion-order ranges after clipping, and identical byte gaps passed to the
-copy functions. The one game A/B was confounded and crashed with the same
-`victory-image-b99f876b74d4a77f.dll+0x2215c35` write-to-null fault as Cut 1a, so
-the switch stays off and no retry was made.
+copy functions. The earlier confounded/crashing run was superseded by the
+canonical fixed-view run (`0.17/0.12/-0.25 ms`, 25 pairs, **no regression**) and
+the combined clean win; Cut 2 is enabled in frozen binary #2.
 
 ### Cut 3: `VICTORY_HEAP_SYNC_SAFE`
 
-`port_journal::on()` also accepts this fresh, off-by-default switch. It makes
+`port_journal::on()` also accepts this switch, which is **on by default in this
+fork** (`VICTORY_HEAP_SYNC_SAFE=0` restores the old wait). It makes
 the same askers (`queue::behind`'s submit-time marks) and the same waiter
 (`host`'s prepare-time `needed()`) use the existing mark path:
 `descriptor::round_after_now()` asks a real heap-sync round earlier and the
@@ -152,8 +161,69 @@ with the switch off no mark is used, with it on the same mark/floor decision is
 used as the old port #7 path while the journal sharding remains off, and that
 `round_after(asked, done)` gives the same result in both states.
 
+### Next heap-wait pieces after Cut 3
+
+Cut 3 cut the end wait from `7.6–8.3 ms` to `3.4–3.7 ms` per frame, but the
+saved time was largely spent in longer list/refresh work on the same side. The
+residual is not page reads (`0 ms`): it is a round-completion wait. Dense on-side
+frames ask about `8` rounds and find about `18` already asked per frame, while
+the sync thread's own 4 ms early rounds (`VICTORY_HEAP_SYNC_EARLY`) can sit just
+ahead of a submission's round.
+
+The remaining A/B-able follow-ups are parked, not in frozen binary #2:
+
+1. `VICTORY_HEAP_SYNC_EARLY=0` changes round timing/snapshot: fewer
+   self-originated rounds run, so an asked round can start at once. Bytes and
+   submission order stay unchanged, and `Over::drop` remains the only completion
+   event. Its earlier game A/B was confounded by movement/frame changes.
+2. `VICTORY_HEAP_SYNC_RUSH` gives the one round a submit waits for the fine job
+   shape (`SYNC_PAGES_FINE`, `SYNC_AT_A_TIME_FINE`) instead of the usual
+   early-round shape. `take_rush_round` gives the shape to only the first round
+   that starts after the ask, then clears the mark. The records mirrored, their
+   order, the wait point and the completion point are unchanged.
+   `rush_chunks_cover_the_same_records_in_order` and `rush_round_is_taken_once`
+   cover the invariants. The user parked it: the ceiling looks small, and its
+   canonical A/B was stopped before completion.
+
+Do not spend the next build on the late-round or prep-write fallbacks: both log
+`0` in the dense phases.
+
+### Helper-count scaling: dropped
+
+Cut 1b's earlier two-pair win did not replicate in the canonical fixed-view run
+(mean `-0.38 ms`, label **no regression**). The canonical
+`VICTORY_WIDE_HELPERS_8` round was also **no regression** (`0/0.1/0.09 ms`, 25
+matched pairs), so the user dropped it: scaling past six helpers does not pay.
+`VICTORY_WIDE_HELPERS_10` is conditional on 8 winning and stays off.
+
+- `VICTORY_WIDE_HELPERS` sets the off-phase active helper count (6 for the
+  6-vs-8 round). It is an ordinary env setting, not a switch.
+- `VICTORY_WIDE_THREADS_MAX` makes the pool large enough for a scaling A/B and
+  stays fixed for the whole run. Its fork default is now six; `=3` restores the
+  old ceiling.
+- `VICTORY_WIDE_HELPERS_8` and `_10` remain A/B-able in the source tree but are
+  off in frozen binary #2.
+- The old refresh-scaling idea also raised `host::fine_job_factor()` to eight;
+  that half is dropped with Cut 1a. Refresh spans stay one piece each; only who
+  claims a piece changes.
+
+`shadow::choose_wide_threads` clamps the requested count into
+`wide_threads()..=VICTORY_WIDE_THREADS_MAX`, and `more_wide_tests` checks that
+6, 8 and 10 claimers cover exactly the same numbers once each. These switches
+are source-tree cuts for frozen binary #2 and are **not** in binary #1.
+
 ## Game A/B protocol
 
+- Restart the PC before any test session that follows a long or overnight run.
+  A machine-state slowdown was observed on 2026-11-27: the same cache, env and
+  binaries loaded at ~1.2/s before a restart and at 69–207/s afterwards. Do not
+  bisect code for this. If the library load rate falls below ~50/s, **stop the
+  run and ask the user to restart the PC**; do not wait it out.
+- Time zones: this PC reports local time as `FLE Standard Time` (UTC+02:00) and
+  game-log lines are UTC (`...Z`). The user's visible clock is UTC+04:00, so
+  add two hours to the PC-local `started=` line or four hours to a log's `Z`
+  timestamp when comparing with what was seen on screen. Check with
+  `Get-TimeZone` and `[DateTimeOffset]::UtcNow` before a session.
 - warmed cache `victory-7900-clean-cache-1`; the harness now defaults to
   `victory-9070-cache-v3-fixed`, a copy with identical `known-pipelines.bin`,
   `known-shaders.bin` and `host-pipelines.bin`. If the manual driver-cache warm
@@ -166,12 +236,58 @@ used as the old port #7 path while the journal sharding remains off, and that
 - `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`
 - passive screen/motion/memory monitor
 - watcher stops at phase 7 or 29.5 GB private and refuses to kill during
-  shader/pipeline creation
+  shader/pipeline creation (the earlier copy-stages-5 protocol only; canonical
+  fixed-view runs below stop at phase 63 or 29.5 GB)
 - no manual input during automated runs
-- Enter-only key schedule including world entry (`2/5/8/11/20/75/78:Enter`),
-  no movement or camera keys, so matched phases share one scene; if translation
-  outlasts the early presses, a later Enter-only window
-  (`150-156/210-216/270:Enter`) is entry assistance, not a second cut variable
+- Fixed-view key schedule: world entry (`2/5/8/11/20/75/78:Enter`) plus paired
+  `F` taps every 15 s from 93 s (`93:F,93.6:F,108:F,...`). `F` is the stand-in
+  pad's left-stick button; the second tap returns stance, and the pair resets
+  the title's idle timer without moving the camera or player. Screenshots at
+  25 s intervals after 120 s changed only 1.6–7.8% of pixels, confined to two
+  small grid cells (scene motion), not a camera-wide cut. There is one view
+  transition around 95–120 s, so the single canonical scored window is phases
+  12–63 inclusive (10 s phases, 120–630 s). Every fixed-view comparison —
+  each single-switch A/B, the combined stack, and any rerun — uses these exact
+  bounds; there are no per-run windows. Score every complete matched pair
+  whose phases lie inside 12–63:
+  - single-switch: consecutive off→on pairs (`12→13` through `62→63`, at most
+    26 pairs);
+  - combined: all-off (bits 0) → all-on (bits 7) pairs (`16→23` through
+    `56→63`, at most 6 pairs).
+- Exclusions: phases with fewer than 3000 draws, incomplete pairs, pairs with
+  more than 3% draw deviation, and visual gaps over 5 luma or 5 non-black
+  points measured over the scored paired phases. If the `29.5 GB` private-memory
+  stopper (or phase 63) ends a run early, score every complete pair inside
+  `12–(last complete phase)` and report the number of pairs; do not extend or
+  shift the window. Fewer than 4 scored pairs is `provisional`, not a decisive
+  label. Earlier two-pair or 10%-tolerance runs remain provisional only.
+
+Canonical fixed-view results on frozen binary #1: Cut 3
+`VICTORY_HEAP_SYNC_SAFE` is a clean win (`-1.42/-1.22/-0.48 ms`, 6 pairs in the
+earlier user-confirmed 12-23 rerun); 1b `-0.38/-0.35/-0.32 ms` over 24 pairs and
+Cut 2 `0.17/0.12/-0.25 ms` over 25 pairs are both no regression. The combined
+stack (1b + Cut 3 + Cut 2) is a clean win over six pairs: `48.08` to `45.47 ms`,
+saving `2.61 ms/frame`, mean/median/p90 `-2.62/-2.63/-0.65 ms`, draws matched
+`y` (`0.6%`), visual gaps `1.9` luma and `0` non-black points. The all-on
+`45.47 ms` remains `0.27 ms` above the `45.2 ms` reference, so this is not yet a
+verified 30 fps result. The user has now deferred visuals: the goal is
+playability — stutters and baseline FPS. The combined stack is frozen as binary
+#2 with 1b, Cut 2 and Cut 3 on by default; 1a, Helper 8 and RUSH stay off.
+
+### Known visual issues (user report, 2026-11-27)
+
+The user reports triangling/shimmer/popping on trees and transparent objects,
+vegetation sometimes neon green, **some trees with red leaves**, fences,
+transparent-object shadows, broken puddles/swamps, and no RT. All of these,
+including the tree colours, are present in the stable branch too. They are
+known issues and are deferred; visuals do not block the playability benchmark.
+The tree colours were previously missing from the known-issues list and are now
+recorded here and in `EXPERIMENT_LOG.md`.
+
+The user's drive reports up to `~24 fps` on bridges/open water and below `20 fps`
+when approaching land masses or areas with more cars/NPCs/objects. That route is
+now the canonical playability benchmark: future cuts are compared over whole-run
+distributions (mean, p90, p99, stutter count) alongside the fixed-view A/B.
 
 `VICTORY_AB=20,VICTORY_HEAP_SYNC_EARLY` is done: no regression, possible 1–2 ms,
 mechanism unconfirmed and confounded by movement/frame differences. Early rounds
@@ -274,7 +390,11 @@ supply the ~15 ms needed for 30 fps, so the order is:
 7. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.
 
-Cuts 1a, 1b and 3 are implemented off by default and awaiting their own A/B runs.
+Cuts 1a, 1b and 3 are implemented off by default in the frozen binary and are
+being re-tested in that order, followed by Cut 2. The heap-wait follow-up
+`VICTORY_HEAP_SYNC_RUSH` and the helper-count switches `VICTORY_WIDE_HELPERS_8`
+and `VICTORY_WIDE_HELPERS_10` are written in the source tree but are not in that
+binary; none is built or run until the frozen A/B sequence has landed.
 Nothing is promoted to a default without a clean run and the user's visual
 check.
 

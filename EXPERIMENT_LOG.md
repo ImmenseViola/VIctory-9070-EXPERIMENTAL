@@ -718,3 +718,275 @@ because the sides do not share a usable visual scene and the run ended in the
 same title-image fault seen in Cut 1a. `VICTORY_PENDING_INDEX` stays off; no
 retry was made. Unit equivalence and full verification remain valid, but no
 game evidence supports promoting the cut.
+
+## Frozen binary re-test and source-tree follow-ups (2026-11-27)
+
+The working tree was committed as `3dde948` ("Freeze four-cut A/B binary and
+protocol harness"), pushed explicitly to the experimental remote's
+`experimental/texture-pass-aside`, and the frozen diagnostics binary's SHA256 is
+`ADC3E24B5BADB952FD6F7A8E59518ADF4DACF3B13F0DB6696D590E0C187399BF`. The
+previous hash is stale. Earlier confounded Cut 1a/1b/Cut 2 runs are superseded
+by this re-test plan, not treated as final labels for the frozen binary.
+
+`warm-frozen-1` was started from that binary after a `victory warm --used`
+preload made 70 host pipelines in 2 s. Scripted Enter is disabled for the warm
+run; `tools/enter-when-quiet.ps1` waits for a quiet translation window and then
+sends Enter every 20 s until >= 3000 draws/frame appear. No game was closed by
+hand.
+
+Two more off-by-default, A/B-able cuts were written in the source tree while
+that warm-up runs, with no rebuild:
+
+- `descriptor::sync_heaps(rush)` gives a submission's heap-sync round the
+  existing fine job shape when `VICTORY_HEAP_SYNC_RUSH` is on. The mark that
+  asks for the round carries the choice; the records, their order, and the
+  round's completion point do not change.
+- `shadow::active_wide_threads` gains `VICTORY_WIDE_HELPERS_8` and
+  `VICTORY_WIDE_HELPERS_10` on top of the `VICTORY_WIDE_HELPERS` off-phase
+  count; `choose_wide_threads` clamps the count to the fixed pool ceiling.
+  `more_wide_tests::scaling_switches_pick_only_helper_counts` checks that the
+  switches change only who claims a piece. The old fine-job half was dropped
+  with cut 1a, so refresh spans still have one piece each.
+
+Both are documented in `EXPERIMENT.md` and need the full gate before any run
+or promotion. They are not in the frozen binary used for the four A/Bs.
+
+`warm-frozen-1` stayed on a black screen because it was launched with
+`VICTORY_KEYS=''`, which suppresses the harness's early Enter-only menu
+schedule; the title never reached world entry. The earlier `0 being made` frame
+line at `12:11:30Z` was only a brief lull: shader translation and host-pipeline
+creation were still active through `12:18:10Z`. OS-level Enter presses were
+irrelevant. The automated session was closed, the queued `warm-frozen-2` restart
+was cancelled, and a `victory warm --all` preload was started but stopped at
+5000/58362 pipelines to free the GPU for a real launch. No user-controlled game
+was closed. `launch-1` now uses the frozen binary and the harness default
+Enter-only schedule (`2/5/8/11/20/75/78:Enter`) with no key override, so it can
+get through the menus and into the world.
+
+## Frozen binary #1 A/B results and idle-view correction (2026-11-27)
+
+All four runs below used the frozen `ADC3E24B…399BF` binary and no rebuild.
+Their labels are **provisional** because the title's idle cinematic can switch
+camera angles between phases; matching draw counts do not rule out a 1–2 ms
+scene difference.
+
+- `frozen-1b-wide` (`VICTORY_WIDE_REFRESH_MORE`): mean/median/p90
+  `-1.6/-1.05/-4.7 ms`, two pairs, draws `+5.2%` on side, luma gap `0.8`.
+  Clean win, but replicate with fixed view and tighter draws.
+- `frozen-1a-fine` (`VICTORY_REFRESH_FINE_JOBS`): no dense phases; title crashed
+  before gameplay (`STOP_REASON=exited`, write-to-null in the title image).
+  Confounded with crash. It is **dropped** from the stack and is not retried;
+  it crashed in both game runs it has had.
+- `frozen-3-heapsync` (`VICTORY_HEAP_SYNC_SAFE`): `-1.6/-1.65/-2.1 ms`, two
+  pairs, draws `-0.8%`, luma gap `4.1`. Clean win, provisional.
+- `frozen-2-pending` (`VICTORY_PENDING_INDEX`): `-0.85/-0.45/-2.85 ms`, two
+  pairs, draws `+1.8%`, luma gap `2.8`. No regression, provisional.
+- `frozen-combined-1` (all three kept cuts in one `VICTORY_AB`): intended four
+  all-off/all-on pairs, but draw deviation was `16.5%`, non-black gap `12.5`
+  points, and the run was stopped at phase 32. `saved_vs_off=-0.67 ms` and
+  `new_frame_time=49.2 ms` are **not usable**; label confounded.
+
+The user identified the cause: while idle, the game enters a cinematic that
+switches camera angles, so a lucky cut is worth as much as these wins. A
+harmless wake-up was found in `VICTORY_KEYS`: paired `F` taps (`F` is the
+stand-in pad's left-stick button) every 15 s from 93 s. The second tap returns
+stance; no movement or camera key is used. `idle-view-f-2` captured eight
+screenshots from 95 s to 270 s. After one transition around 95–120 s, the
+25 s pairwise change was `1.6–7.8%`, with only two of twelve grid cells above
+15% change (localized scene motion), and luma/non-black stayed near
+`25–27 / 67–74%`. The contact sheet is
+`C:\mygame\victory-work\idle-view-f-2-contact.png`.
+
+New harnesses `run-fixed-ab.ps1` and `run-fixed-combined.ps1` use that key
+schedule, ten-second phases, six matched pairs, and a per-pair draw tolerance
+of 3%. Single-switch pairs start at phase 12 (120 s); combined pairs start at
+phase 16. The visual-gap check is scoped to those same phases, so the early
+view transition cannot decide a label. The fixed rerun order is Cut 3, 1b,
+Cut 2, then combined.
+
+Two report bugs were found in that first fixed run and fixed before the next
+one. `run-fixed-ab.ps1` used `$Matches[9]` for draws where its regex has only
+eight groups (the frozen script's regex has a leading timestamp and correctly
+uses `[8]`), so it discarded every phase and reported zero pairs. The read-only
+`rescore-fixed-ab.ps1` helper was added, and `ab-full-report.ps1` now keeps the
+phase before the window solely for timestamp mapping; previously early black
+samples at the window edge were attributed to phase 12. Neither bug changed
+game behavior or the frozen binary.
+
+Fixed `fixed-3-heapsync` (`VICTORY_HEAP_SYNC_SAFE`), rescored over phases
+12-23: mean/median/p90 `-1.42/-1.22/-0.48 ms` over six matched pairs, draws
+matched `y` (`0.3%` mean deviation, `7210/7203`), visual gaps `0.1` luma and
+`0.3` non-black points. Label: **clean win**. Max private memory was `22.65 GB`,
+well below the `29.5 GB` stopper. The end-of-frame heap wait was `2.3-3.8 ms`
+on side versus `3.8-7.3 ms` off across those pairs, while list work remained
+the dominant cost. Cut 3 is kept, but promotion still needs the combined run
+and a user visual check.
+
+The user then fixed one canonical scored window for all remaining comparisons:
+**phases 12–63 inclusive** (10 s phases, 120–630 s). There are no per-run
+windows. `EXPERIMENT.md` and all harnesses now use it. Every complete matched
+pair inside the window is scored: single-switch runs use consecutive off→on
+pairs (`12→13` through `62→63`), and the combined run uses all-off→all-on pairs
+(`16→23` through `56→63`). Exclusions are unchanged: at least 3000 draws, at
+most 3% pair draw deviation, and visual gaps at most 5 luma / 5 non-black
+points over the scored phases. If the 29.5 GB stopper or phase 63 ends a run
+early, score every complete pair inside `12–(last complete phase)` and report
+the count; never extend or shift the window. Fewer than 4 pairs is flagged
+`provisional`. The just-launched 1b was stopped before it produced a result and
+restarted with the canonical stopper at phase 63 and a 14-minute cap. Cut 3
+stays user-confirmed under its earlier 12–23 window and is not being rescored.
+
+Invalidated canonical 1b run: the user reported that the game opened to a
+different scene mid-run, so its phases are not comparable. The process was left
+running at the user's request so they could revert to the old scene. The user
+also reported that **ped flashing and triangling are back** in this scene; this
+is a visual/promotion concern and must be rechecked before any stacked build is
+accepted. After the user restored the old scene, they chose a clean restart.
+The invalidated run was stopped and 1b was relaunched as `fixed-1b-wide-2`
+with the canonical 12–63 window and a fresh tag, so no stale files carry over.
+
+Canonical `fixed-1b-wide-2` (`VICTORY_WIDE_REFRESH_MORE`), phases 12-63:
+mean/median/p90 `-0.38/-0.35/-0.32 ms` over 24 matched pairs, draws matched
+`y` (`0.4%` mean deviation, `8514/8504`), visual gaps `0.2` luma and `0.2`
+non-black points. Label: **no regression**, not a repeat of the earlier
+two-pair `clean win`. Two pairs (`58->59`, `62->63`) exceeded the 3% draw
+tolerance and were excluded; the run ended cleanly at phase 63 with max private
+memory `23.67 GB`. The earlier scene-change run was not scored. 1b remains off
+in the frozen binary and is not promoted on this evidence; the combined run
+will still measure it with the other kept cuts.
+
+Canonical `fixed-2-pending` (`VICTORY_PENDING_INDEX`), phases 12-63:
+mean/median/p90 `0.17/0.12/-0.25 ms` over 25 matched pairs, draws matched `y`
+(`0.3%` mean deviation, `7998/7985`), visual gaps `0.1` luma and `0` non-black
+points. Label: **no regression**. One pair (`62->63`) exceeded the 3% draw
+tolerance and was excluded; the run ended cleanly at phase 63 with max private
+memory `23.58 GB`. The earlier two-pair `no regression` result is superseded by
+this canonical run. Cut 2 remains off in the frozen binary and is not promoted
+on this evidence. No source rebuild or promotion occurred.
+
+The combined harness had one remaining window inconsistency: its visual-gap
+check included phase 12 even though combined pairs start at 16. It now records
+the off/on phase number on each pair and measures visual gaps only over the
+exact phases that form scored pairs, still within canonical 12-63. The canonical
+combined run was started as `fixed-combined-2` with a fresh tag on frozen binary
+#1, combining 1b, Cut 3 and Cut 2.
+
+Canonical `fixed-combined-2`, canonical paired phases 16-63: all-off mean
+`48.08 ms`, all-on mean `45.47 ms`, **saved `2.61 ms/frame`**; mean/median/p90
+deltas `-2.62/-2.63/-0.65 ms` over six matched pairs. New all-on frame time was
+`45.47 ms`, still `+0.27 ms` above the `45.2 ms` baseline, so the stack closes
+most but not all of the measured gap. Draws matched `y` (`0.6%` mean deviation,
+`7610/7563`). Scoped visual gaps were `1.9` luma and `0` non-black points; over
+the exact paired phases, off/on luma was `103.56/105.42`, non-black
+`96.76%/96.78%`, mean private `22.87/22.98 GB`, max private `23.09/23.20 GB`,
+well below the `29.5 GB` stopper. Label: **clean win**; stopper
+`STOP_REASON=clean cycle ending at phase 63`.
+
+Top critical-path stages in all-on phases (69 samples each): lists steps
+`21.03 ms`, asking write watch `5.03`, snapshots `2.32`, waiting heap records at
+end `2.17`, copies in card memory `2.11`, putting bytes under flight writes
+`1.74`, planning on card `1.40`, sending lists `1.09`, waiting flights `0.17`,
+heap records swept `0.03`, waiting submission lock `0`. This confirms that
+even after the stack, list/refresh work and write-watch asking dominate; heap end
+wait is no longer the largest cost.
+
+User asked whether `2.17 ms` was the same counter as the earlier `8.65 ms` heap
+waits. It is: `critical_line` maps `SPLIT[15]` to `heap waits`, and `split_line`
+prints the same `SPLIT[15]` as `at the end N waiting for the heaps' records`.
+Over the combined scored pair phases, that counter averaged `9.31 ms` all-off
+versus `2.16 ms` all-on, consistent with Cut 3 being active on side; the earlier
+`8.65 ms` was a pre-Cut-3 baseline. The `2.17 ms` stage-table value is not a
+different or misparsed counter.
+
+Next-heap analysis: Cut 3 cut the end wait from `7.6–8.3 ms` to `3.4–3.7 ms`,
+but list/refresh work grew on the same side. Dense on-side frames ask about
+`8` rounds and find about `18` already asked per frame; raw heap page reads are
+`0`. The residual is round-completion scheduling behind the sync thread's 4 ms
+early rounds. `VICTORY_HEAP_SYNC_EARLY=0` is already A/B-able but changes
+snapshot timing and had a confounded earlier run. `VICTORY_HEAP_SYNC_RUSH`
+uses fine jobs for only the first asked submission round. Its helper
+`take_rush_round` and the tests `rush_chunks_cover_the_same_records_in_order`
+and `rush_round_is_taken_once` were added in the source tree. All 448 unit
+tests pass with `--features diagnostics`. No rebuild was made during the
+frozen sequence.
+
+## Candidate build and gate for frozen binary #2 (2026-11-27)
+
+The source-tree follow-ups were built with
+`CARGO_TARGET_DIR=C:\mygame\victory-work\VIctory-9070-EXPERIMENTAL\target-exp`
+into `target-exp\diag\victory.exe`, SHA256
+`35CF13EDCE55075398D06F1449DA3E894D328F35E0854114C60B9A689C37C00D`.
+Frozen binary #1 at `target\diag\victory.exe` was rehashed after the build and
+remains `ADC3E24B5BADB952FD6F7A8E59518ADF4DACF3B13F0DB6696D590E0C187399BF`.
+No `victory.exe` was running during the build.
+
+The full gate rerun passed: the xtask switch-doc test, the whole workspace test
+suite, `cargo check --workspace --all-features --locked`,
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+`git diff --check`, and the diag build. The watch test
+`a_write_through_another_view_is_reported_at_the_guarded_one` failed once in
+the first suite run and then passed both isolated with `--exact` and in the
+complete rerun; a different watch timing test failed in the first run, so the
+failure is the known pre-existing flake and not caused by these cuts.
+
+`cargo fmt --all -- --check` remains a documented pre-existing exception: a
+detached HEAD worktree has `3206` `Diff in` headers and this tree has `3211`;
+the five added headers are `descriptor.rs` +`2` and `host.rs` +`3`. The final
+default-on edits add none in `ab.rs`, `shadow.rs`, or `port_journal.rs`.
+Auto-formatting those files would rewrite thousands of unrelated pre-existing
+lines, so it is not done. The formatting exception is not a claim that the fmt
+check passes; all other listed gate steps pass and the added formatting drift
+changes no run-time behavior.
+
+Canonical candidate A/B `cand-helper8-1` (`VICTORY_WIDE_HELPERS_8`, with
+`VICTORY_WIDE_THREADS_MAX=8` and `VICTORY_WIDE_HELPERS=6` on both sides), phases
+12-63: mean/median/p90 `0/0.1/0.09 ms` over 25 matched pairs, draws matched `y`
+(`0.3%` mean deviation, `7536/7536`), visual gaps `0` luma and `0` non-black
+points. Per-side monitor means were luma `116.6/116.6`, non-black `96.9%/96.9%`,
+mean private `22.53/22.56 GB`, max private `22.77/22.80 GB`. Pair `62->63` was
+excluded for a `28.3%` draw deviation. Label: **no regression**; stopper
+`STOP_REASON=clean cycle ending at phase 63`. Helper 8 remains off by default;
+`VICTORY_WIDE_HELPERS_10` stays conditional and is not in this build.
+
+The follow-up RUSH run `cand-rush-1` was started with
+`VICTORY_HEAP_SYNC_SAFE=1` on both sides, but the user ended the testing session
+before it completed. The process tree was terminated at the user's request; no
+full report was produced and the run has no score, label, or promotional value.
+It will need a fresh tag if RUSH is retried.
+
+## User decisions: helper scaling, RUSH, visuals, driving benchmark (2026-11-27)
+
+The user dropped `VICTORY_WIDE_HELPERS_8`: 25 matched pairs, `0/0.1/0.09 ms`,
+**no regression**, so scaling past six helpers does not pay.
+`VICTORY_WIDE_HELPERS_10` stays conditional and off. RUSH is parked: its ceiling
+looks small and no canonical A/B completed; it stays off and source-tree only.
+
+The user's visual check is **deferred**. Their report: triangling/shimmer/popping
+on trees and transparent objects, vegetation sometimes neon green, **some trees
+with red leaves**, fences, transparent-object shadows, broken puddles/swamps,
+and no RT. All of it, including the tree colours, is present in the stable
+branch too. Tree colours were missing from the known-issues list and are now
+recorded in `EXPERIMENT.md` and `README.md`. Visual parity with the stable
+branch is accepted as known behaviour; visuals do not block playability work.
+
+The user's drive reports up to `~24 fps` on bridges/open water and below `20 fps`
+when approaching land masses or areas with more cars/NPCs/objects. The fixed
+route — house, car, bridges, approach landmasses — is now the canonical
+playability benchmark. Future cuts will be compared by the user driving off vs
+on over whole-run distributions (mean, p90, p99, stutter count) alongside the
+fixed-view A/B for precise milliseconds.
+
+The user chose frozen binary #2 as frozen #1 plus the combined stack: 1b, Cut 2
+and Cut 3 on by default in this fork. 1a, Helper 8 and RUSH stay off. The goal is
+playability (stutters and baseline FPS), not further visual changes.
+
+The final gate rerun passed after the clippy fix and the trailing-blank-line
+fix: watch flake retry, the whole workspace suite, `cargo check`, `cargo clippy
+--workspace --all-targets --all-features --locked -- -D warnings`, `git diff
+--check`, and the diag build. No `victory.exe` was running when the final binary
+was copied to `target\diag\victory.exe`. Frozen binary #2 is SHA256
+`7A04F327CC83F0889F204E4F28C0EB958BAFFBAF335F349C13086CEC0E8D1790`; frozen #1
+remains archived at `target\diag\victory-frozen-1.exe` with SHA256
+`ADC3E24B5BADB952FD6F7A8E59518ADF4DACF3B13F0DB6696D590E0C187399BF`. The
+earlier `35CF13ED...` candidate predates the final clippy fix and is not the
+frozen binary.

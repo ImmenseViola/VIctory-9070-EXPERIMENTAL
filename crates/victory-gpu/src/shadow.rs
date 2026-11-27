@@ -1636,37 +1636,65 @@ fn wide_threads() -> usize {
 }
 
 /// Cut 1b: more helpers can be kept alive, but are idle at the usual count.
-/// `VICTORY_WIDE_THREADS_MAX` only raises the pool a run may switch into.
+/// `VICTORY_WIDE_THREADS_MAX` only raises the pool a run may switch into. The
+/// default ceiling is six in this fork, matching the canonical combined run;
+/// `VICTORY_WIDE_THREADS_MAX=3` restores the old ceiling.
 fn max_wide_threads() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let asked = *MAX.get_or_init(|| {
         std::env::var("VICTORY_WIDE_THREADS_MAX")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(wide_threads)
+            .unwrap_or(6)
     });
     asked.clamp(wide_threads(), 16)
 }
 
-/// The helper count this call uses. `VICTORY_WIDE_REFRESH_MORE` is A/B-able;
-/// off by default. A named `VICTORY_AB` switch decides it at every dispatch,
-/// so the pool must already hold the extra idle threads.
-fn active_wide_threads() -> usize {
-    let default = wide_threads();
-    let more = experiment("VICTORY_WIDE_REFRESH_MORE", || {
-        static MORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *MORE.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH_MORE").is_some_and(|v| v == "1"))
-    });
-    if more { max_wide_threads() } else { default }
+/// The helper count this call uses. `VICTORY_WIDE_REFRESH_MORE` is the 1b
+/// switch: on by default in this fork uses the run's `VICTORY_WIDE_THREADS_MAX`
+/// ceiling, while `VICTORY_WIDE_REFRESH_MORE=0` uses the usual count. The later
+/// scaling switches raise the active count to a fixed eight or ten helpers; the
+/// pool must already hold those idle threads. Both scaling switches are off and
+/// A/B-able, and only who claims a piece changes.
+///
+/// `VICTORY_WIDE_HELPERS` sets the off-phase count of a scaling A/B (six for
+/// the 6-vs-8 round, eight for the 8-vs-10 round). It is not itself a switch.
+fn choose_wide_threads(base: usize, more: bool, eight: bool, ten: bool, min: usize, max: usize) -> usize {
+    let mut active = base;
+    if more {
+        active = max;
+    }
+    if eight {
+        active = 8;
+    }
+    if ten {
+        active = 10;
+    }
+    active.clamp(min, max)
 }
 
-/// Advisory index over the pending write ranges. Off by default, A/B-able;
-/// the vector stays authoritative and every indexed answer is compared with
-/// the old scan by `pending_index_tests`.
+fn active_wide_threads() -> usize {
+    let base = std::env::var("VICTORY_WIDE_HELPERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(wide_threads);
+    let more = experiment("VICTORY_WIDE_REFRESH_MORE", || {
+        static MORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MORE.get_or_init(|| crate::ab::default_on("VICTORY_WIDE_REFRESH_MORE"))
+    });
+    let eight = experiment("VICTORY_WIDE_HELPERS_8", || false);
+    let ten = experiment("VICTORY_WIDE_HELPERS_10", || false);
+    choose_wide_threads(base, more, eight, ten, wide_threads(), max_wide_threads())
+}
+
+/// Advisory index over the pending write ranges. On by default in this fork;
+/// `VICTORY_PENDING_INDEX=0` restores the old scans. A/B-able; the vector stays
+/// authoritative and every indexed answer is compared with the old scan by
+/// `pending_index_tests`.
 fn pending_index() -> bool {
     experiment("VICTORY_PENDING_INDEX", || {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_INDEX").is_some_and(|v| v == "1"))
+        *ON.get_or_init(|| crate::ab::default_on("VICTORY_PENDING_INDEX"))
     })
 }
 
@@ -6308,11 +6336,24 @@ mod more_wide_tests {
 
     #[test]
     fn more_helpers_claim_the_same_work() {
-        for helpers in [1, 3, 7] {
+        for helpers in [1, 3, 6, 8, 10] {
             for n in [0, 1, 4, 33, 1000] {
                 assert_eq!(claimed(n, helpers), (0..n).collect::<Vec<_>>());
             }
         }
+    }
+
+    /// The scaling A/Bs change only who claims a number: the off count comes
+    /// from `VICTORY_WIDE_HELPERS`, the on count is eight or ten, and neither
+    /// may exceed the pool the run made.
+    #[test]
+    fn scaling_switches_pick_only_helper_counts() {
+        assert_eq!(super::choose_wide_threads(6, false, false, false, 3, 10), 6);
+        assert_eq!(super::choose_wide_threads(6, false, true, false, 3, 10), 8);
+        assert_eq!(super::choose_wide_threads(8, false, false, true, 3, 10), 10);
+        assert_eq!(super::choose_wide_threads(6, true, false, false, 3, 6), 6);
+        assert_eq!(super::choose_wide_threads(6, false, true, false, 3, 6), 6);
+        assert_eq!(super::choose_wide_threads(2, false, false, false, 3, 10), 3);
     }
 }
 

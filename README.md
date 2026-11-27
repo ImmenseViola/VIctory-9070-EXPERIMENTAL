@@ -138,8 +138,12 @@ already has a persistent `wide*` worker pool.
 ## Known problems
 
 - Trees and grass still shimmer/flicker, including in the boat scene. One piece
-  of vegetation rendered neon green in the playthrough. The skinning fix did
-  not touch vegetation.
+  of vegetation rendered neon green in the playthrough, and some trees show red
+  leaves. Both are present in the stable branch too and are known, deferred
+  issues. The skinning fix did not touch vegetation.
+- Triangling/popping on trees and transparent objects, transparent-object
+  shadows, fences, and broken puddles/swamps are also known and present in the
+  stable branch. Ray tracing is not active.
 - Glass sometimes renders black. Sunglasses and eyes can look blueish, as if a
   reflection pass were wrong.
 - In dialogue, face textures and beards moved but the model's lips did not in

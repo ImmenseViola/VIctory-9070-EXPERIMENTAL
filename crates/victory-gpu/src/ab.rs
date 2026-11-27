@@ -44,6 +44,13 @@ pub(crate) fn on(bit: u32) -> bool {
     BITS.load(Relaxed) >> bit & 1 != 0
 }
 
+/// A cut that is on in this fork unless the run explicitly turns it off with
+/// `NAME=0`. A switch named in `VICTORY_AB` never reaches this reader: the
+/// phases decide it instead.
+pub(crate) fn default_on(name: &str) -> bool {
+    std::env::var_os(name).is_none_or(|v| v != "0")
+}
+
 /// What the run has seen of the phase under way.
 struct Phase {
     started: std::time::Instant,

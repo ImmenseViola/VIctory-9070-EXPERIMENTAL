@@ -1204,6 +1204,29 @@ mod tests {
         assert_eq!(fine.iter().map(|(_, f, t)| t - f).sum::<usize>(), 30 + super::FINE_JOB_ALIGN * 3 - 30);
     }
 
+    /// Dormant after Cut 1a was dropped: `fine_spans` still keeps the same
+    /// byte-for-byte union and span order at eight jobs, but scaling now
+    /// changes only the helper count and leaves this path at one piece.
+    #[test]
+    fn scaled_refresh_jobs_have_the_same_bytes_in_the_same_order() {
+        let spans = vec![(0u8, 0usize, 10usize), (1, 10, 30), (2, 30, 30), (3, 30, super::FINE_JOB_ALIGN * 8)];
+        let scaled = super::fine_spans(spans.clone(), 8);
+        for (key, from, to) in &scaled {
+            assert!(*from <= *to && *to <= spans[*key as usize].2);
+        }
+        for (key, from, to) in spans {
+            let parts: Vec<_> = scaled.iter().filter(|(k, _, _)| *k == key).cloned().collect();
+            assert_eq!(parts.first().map(|p| p.1), Some(from));
+            assert_eq!(parts.last().map(|p| p.2), Some(to));
+            for pair in parts.windows(2) {
+                assert_eq!(pair[0].2, pair[1].1);
+                assert_eq!(pair[0].2 % super::FINE_JOB_MIN, 0);
+            }
+            assert!(parts.len() <= 8);
+        }
+        assert_eq!(scaled.iter().map(|(_, f, t)| t - f).sum::<usize>(), super::FINE_JOB_ALIGN * 8);
+    }
+
     /// Cut 1a: a job boundary is never inside a 4 KiB page, so two jobs of
     /// one shadow cannot write the same page. Large spans get 64 KiB
     /// boundaries; short ones stay whole.
@@ -8044,7 +8067,10 @@ fn align_up(value: usize, align: usize) -> usize {
 }
 
 /// How many pieces a refresh span gives with `VICTORY_REFRESH_FINE_JOBS=1`.
-/// The switch is A/B-able; off by default.
+/// The switch is A/B-able and off by default, but Cut 1a is dropped from the
+/// stack after title crashes in both game runs: do not use it in new cuts.
+/// Scaling now changes only the helper count in `shadow::active_wide_threads`;
+/// it leaves these jobs at one piece per span.
 fn fine_job_factor() -> usize {
     let default = || {
         static ON: OnceLock<bool> = OnceLock::new();

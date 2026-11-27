@@ -213,9 +213,52 @@ fn sync_early() -> Option<std::time::Duration> {
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
+/// Cut 3b: a round asked for by a submit (`VICTORY_HEAP_SYNC_SAFE` or renderer
+/// port #7) is on the submitting thread's critical path. Give that round the
+/// finer jobs used by `VICTORY_SYNC_FINE`, with more smaller pieces for the
+/// helpers, instead of the usual early-round shape. The bytes mirrored and the
+/// round's completion point do not change; only the pieces handed to helpers do.
+///
+/// Off by default; `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_RUSH` compares it.
+#[cfg(windows)]
+fn heap_sync_rush() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_RUSH") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_RUSH").is_some_and(|v| v == "1"))
+}
+
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+
+/// The first round asked for by a submit that should use the rush shape while
+/// the switch is on. Cleared when that round starts, so a later early round
+/// keeps the usual shape.
+#[cfg(windows)]
+static RUSH_ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether round `next` is the one asked submission round that gets the rush
+/// shape. Taking it clears the mark; later rounds keep the usual shape. The
+/// round counter and completion point are not touched here.
+#[cfg(windows)]
+fn take_rush_round(next: u64, on: bool, mark: &std::sync::atomic::AtomicU64) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    if !on {
+        mark.store(0, Relaxed);
+        return false;
+    }
+    match mark.load(Acquire) {
+        0 => false,
+        round if round <= next => {
+            mark.store(0, Release);
+            true
+        }
+        _ => false,
+    }
+}
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
@@ -225,7 +268,7 @@ pub(crate) struct SyncedHeaps(Option<u64>);
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     if !sync_aside() {
-        sync_heaps();
+        sync_heaps(false);
         return SyncedHeaps(None);
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -260,20 +303,22 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                         break;
                     }
                 }
+                let next = r.1 + 1;
                 drop(r);
+                let rush = take_rush_round(next, heap_sync_rush(), &RUSH_ROUND);
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
                 });
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
-                let _ = std::panic::catch_unwind(sync_heaps);
+                let _ = std::panic::catch_unwind(|| sync_heaps(rush));
             }
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
     if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
-        sync_heaps();
+        sync_heaps(false);
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -303,6 +348,9 @@ pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
     rounds.0 = rounds.0.max(mark);
     drop(rounds);
     if asked {
+        if heap_sync_rush() {
+            RUSH_ROUND.fetch_min(mark, std::sync::atomic::Ordering::AcqRel);
+        }
         SYNC_ROUNDS.1.notify_all();
         crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
@@ -329,6 +377,9 @@ pub(crate) fn round_after_now() -> u64 {
     if ask {
         rounds.0 = round;
         drop(rounds);
+        if heap_sync_rush() {
+            RUSH_ROUND.fetch_min(round, std::sync::atomic::Ordering::AcqRel);
+        }
         SYNC_ROUNDS.1.notify_all();
         crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -381,9 +432,11 @@ impl Drop for SyncedHeaps {
 /// slots a frame in the world of the title this fork works on, against a
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
-/// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+/// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts. `rush` uses
+/// the fine job shape for a round the submitting thread waits for; it changes
+/// no bytes and no completion point.
 #[cfg(windows)]
-pub(crate) fn sync_heaps() {
+pub(crate) fn sync_heaps(rush: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
@@ -415,7 +468,7 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        let (pages_a_job, records_a_job) = sync_jobs();
+        let (pages_a_job, records_a_job) = if rush { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { sync_jobs() };
         let phase = crate::timeline::span("the heaps' records: those that waited");
         crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
             for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
@@ -1933,12 +1986,45 @@ mod tests {
                 )
             };
             assert!(!host.made(5));
-            sync_heaps();
+            sync_heaps(false);
             assert!(host.made(5));
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// Cut 3b gives a waited-for round smaller jobs, but it must mirror the
+    /// same records in the same order as the usual job shape.
+    #[cfg(windows)]
+    #[test]
+    fn rush_chunks_cover_the_same_records_in_order() {
+        let before: Vec<u32> = (0..1000).collect();
+        for size in [SYNC_AT_A_TIME, SYNC_AT_A_TIME_FINE] {
+            let flat: Vec<u32> = (0..before.len().div_ceil(size))
+                .flat_map(|n| before.chunks(size).nth(n).unwrap_or_default().iter().copied())
+                .collect();
+            assert_eq!(flat, before, "chunk size {size}");
+        }
+    }
+
+    /// The rush shape belongs to the first round that starts after the ask,
+    /// and only once. A later early round keeps the usual job shape.
+    #[cfg(windows)]
+    #[test]
+    fn rush_round_is_taken_once() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let mark = AtomicU64::new(0);
+        mark.store(5, SeqCst);
+        assert!(super::take_rush_round(5, true, &mark));
+        assert_eq!(mark.load(SeqCst), 0);
+        assert!(!super::take_rush_round(6, true, &mark));
+        mark.store(7, SeqCst);
+        assert!(!super::take_rush_round(6, true, &mark));
+        assert!(super::take_rush_round(7, true, &mark));
+        mark.store(8, SeqCst);
+        assert!(!super::take_rush_round(8, false, &mark));
+        assert_eq!(mark.load(SeqCst), 0);
     }
 
     #[test]
