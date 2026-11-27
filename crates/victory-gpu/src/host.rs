@@ -109,9 +109,9 @@ unsafe impl Send for Retired {}
 
 /// An experiment's switch, read every time so `VICTORY_AB` can turn it at a
 /// present. Off by default unless its own variable opts in.
-fn experiment(name: &str, default: impl FnOnce() -> bool) -> bool {
+fn experiment(_name: &str, default: impl FnOnce() -> bool) -> bool {
     #[cfg(all(windows, feature = "diagnostics"))]
-    if let Some(on) = crate::switched(name) {
+    if let Some(on) = crate::switched(_name) {
         return on;
     }
     default()
@@ -1186,7 +1186,7 @@ mod tests {
     /// span order, and never invent or drop a byte at a piece boundary.
     #[test]
     fn fine_refresh_jobs_have_the_same_bytes_in_the_same_order() {
-        let spans = vec![(0u8, 0usize, 10usize), (1, 10, 30), (2, 30, 30), (3, 30, super::FINE_JOB_BYTES * 3)];
+        let spans = vec![(0u8, 0usize, 10usize), (1, 10, 30), (2, 30, 30), (3, 30, super::FINE_JOB_ALIGN * 3)];
         assert_eq!(super::fine_spans(spans.clone(), 1), spans);
         let fine = super::fine_spans(spans.clone(), 4);
         for (key, from, to) in &fine {
@@ -1201,7 +1201,52 @@ mod tests {
             }
             assert!(parts.len() <= 4);
         }
-        assert_eq!(fine.iter().map(|(_, f, t)| t - f).sum::<usize>(), 30 + super::FINE_JOB_BYTES * 3 - 30);
+        assert_eq!(fine.iter().map(|(_, f, t)| t - f).sum::<usize>(), 30 + super::FINE_JOB_ALIGN * 3 - 30);
+    }
+
+    /// Cut 1a: a job boundary is never inside a 4 KiB page, so two jobs of
+    /// one shadow cannot write the same page. Large spans get 64 KiB
+    /// boundaries; short ones stay whole.
+    #[test]
+    fn fine_refresh_jobs_are_page_aligned_and_do_not_share_pages() {
+        let spans = vec![
+            (0u8, 0x1001usize, 0x1001 + super::FINE_JOB_ALIGN + 3 * super::FINE_JOB_MIN + 17),
+            (1, 0x2abcd, 0x2abcd + 3 * super::FINE_JOB_ALIGN + 11),
+            (2, 7, 7 + super::FINE_JOB_MIN - 1),
+            (3, 1, 1 + 4 * super::FINE_JOB_ALIGN),
+        ];
+        let fine = super::fine_spans(spans.clone(), 4);
+        for (key, from, to) in spans {
+            let parts: Vec<_> = fine.iter().filter(|(k, _, _)| *k == key).cloned().collect();
+            assert_eq!(parts.first().map(|p| p.1), Some(from));
+            assert_eq!(parts.last().map(|p| p.2), Some(to));
+            for pair in parts.windows(2) {
+                assert_eq!(pair[0].2, pair[1].1);
+                assert_eq!(pair[0].2 % super::FINE_JOB_MIN, 0, "boundary inside a page");
+            }
+            if parts.len() > 1 {
+                for (_, f, t) in &parts {
+                    assert!(*t - *f >= super::FINE_JOB_MIN, "piece smaller than a page");
+                }
+            }
+            let mut seen = std::collections::HashMap::new();
+            for (i, (_, f, t)) in parts.iter().enumerate() {
+                if f == t {
+                    continue;
+                }
+                for page in (*f / super::FINE_JOB_MIN)..=(*t - 1) / super::FINE_JOB_MIN {
+                    assert!(seen.insert(page, i).is_none(), "page {page} appears in two jobs");
+                }
+            }
+        }
+        let aligned: Vec<_> = fine
+            .iter()
+            .filter(|(key, _, _)| *key == 3)
+            .map(|(_, f, _)| *f)
+            .skip(1)
+            .collect();
+        assert_eq!(aligned.len(), 3);
+        assert!(aligned.iter().all(|at| at % super::FINE_JOB_ALIGN == 0));
     }
 
     /// A list of ours is found by its name, with the debug layer's note or not.
@@ -3641,6 +3686,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// The parts of one relay fetch's time, for [`COPY_BACK_PARTS`]. Kept with the
 /// fetch so the split follows it from recording to landing.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct CopyBackSplit {
     wait_us: u64,
     fetch_us: u64,
@@ -7983,9 +8029,19 @@ fn flush_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     crate::shadow::wide_each(n, work);
 }
 
-/// Cut 1a: split each refresh span into more jobs, but never below this many
-/// bytes a job (the queue costs more than the copy below it).
-const FINE_JOB_BYTES: usize = 256 << 10;
+/// Cut 1a: split each refresh span into more jobs, with internal boundaries
+/// aligned to a host page at minimum and to 64 KiB whenever the span can hold
+/// pieces that large. The queue costs more than the copy below a page.
+const FINE_JOB_ALIGN: usize = 64 << 10;
+const FINE_JOB_MIN: usize = 4 << 10;
+
+fn align_down(value: usize, align: usize) -> usize {
+    value / align * align
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.div_ceil(align) * align
+}
 
 /// How many pieces a refresh span gives with `VICTORY_REFRESH_FINE_JOBS=1`.
 /// The switch is A/B-able; off by default.
@@ -7998,8 +8054,11 @@ fn fine_job_factor() -> usize {
 }
 
 /// The byte-for-byte union of `spans`, in the same order, with each span cut
-/// into at most `factor` pieces and no piece below [`FINE_JOB_BYTES`] unless
-/// the span itself is smaller. `factor == 1` returns the spans untouched.
+/// into at most `factor` pieces. Every internal boundary is a multiple of
+/// [`FINE_JOB_MIN`], so no two pieces of one shadow share a page; where the
+/// span is large enough, boundaries are moved to [`FINE_JOB_ALIGN`] instead.
+/// No split piece is smaller than a page; a span shorter than that stays whole.
+/// `factor == 1` returns the spans untouched.
 fn fine_spans<T: Clone>(spans: Vec<(T, usize, usize)>, factor: usize) -> Vec<(T, usize, usize)> {
     if factor <= 1 {
         return spans;
@@ -8007,16 +8066,44 @@ fn fine_spans<T: Clone>(spans: Vec<(T, usize, usize)>, factor: usize) -> Vec<(T,
     let mut out = Vec::with_capacity(spans.len() * factor);
     for (shadow, from, to) in spans {
         let len = to.saturating_sub(from);
-        if len == 0 {
+        if len <= FINE_JOB_MIN {
             out.push((shadow, from, to));
             continue;
         }
-        let pieces = len.div_ceil(FINE_JOB_BYTES).clamp(1, factor);
-        let step = len.div_ceil(pieces);
-        for i in 0..pieces {
-            let at = from + i * step;
-            out.push((shadow.clone(), at, (at + step).min(to)));
+        let pieces = factor.clamp(1, len / FINE_JOB_MIN);
+        if pieces == 1 {
+            out.push((shadow, from, to));
+            continue;
         }
+        let ideal = len / pieces;
+        let mut at = from;
+        for i in 1..pieces {
+            let remaining = pieces - i;
+            // Leave a page for this piece and one for each piece after it.
+            let lower = align_up(at + FINE_JOB_MIN, FINE_JOB_MIN);
+            let upper = align_down(to.saturating_sub(remaining * FINE_JOB_MIN), FINE_JOB_MIN);
+            if lower > upper {
+                break;
+            }
+            let wanted = from + ideal * i;
+            let down = align_down(wanted, FINE_JOB_ALIGN);
+            let end = if (lower..=upper).contains(&down) {
+                down
+            } else {
+                let up = align_up(wanted, FINE_JOB_ALIGN);
+                if (lower..=upper).contains(&up) {
+                    up
+                } else {
+                    lower
+                }
+            };
+            if end <= at || end >= to {
+                break;
+            }
+            out.push((shadow.clone(), at, end));
+            at = end;
+        }
+        out.push((shadow, at, to));
     }
     out
 }

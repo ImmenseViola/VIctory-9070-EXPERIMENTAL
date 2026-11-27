@@ -1,6 +1,7 @@
 param(
     [string] $Tag = 'ab-batch-port7-1',
-    [int] $FirstPhase = 0
+    [int] $FirstPhase = 0,
+    [double] $MinDraws = 3000
 )
 
 $root = 'C:\mygame\victory-work'
@@ -13,6 +14,7 @@ Get-Content $log | ForEach-Object {
     }
     $phase = [int]$Matches[1]
     if ($phase -lt $FirstPhase) { return }
+    if ([double]$Matches[8] -lt $MinDraws) { return }
     $rows += [pscustomobject]@{
         phase = $phase
         bits = [int]$Matches[2]
@@ -25,7 +27,7 @@ Get-Content $log | ForEach-Object {
     }
 }
 
-"phases from $FirstPhase, grouped by switch bits"
+"dense phases from $FirstPhase (>= $MinDraws draws), grouped by switch bits"
 $rows | Group-Object bits | ForEach-Object {
     $g = $_.Group
     [pscustomobject]@{

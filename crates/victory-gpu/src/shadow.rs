@@ -1017,6 +1017,7 @@ impl Pending {
         self.ranges.is_empty()
     }
 
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     fn ranges(&self) -> &[(usize, usize)] {
         &self.ranges
     }
@@ -1670,9 +1671,9 @@ fn pending_index() -> bool {
 }
 
 /// Shared experiment reader for the shadow wide path.
-fn experiment(name: &str, default: impl FnOnce() -> bool) -> bool {
+fn experiment(_name: &str, default: impl FnOnce() -> bool) -> bool {
     #[cfg(all(windows, feature = "diagnostics"))]
-    if let Some(on) = crate::switched(name) {
+    if let Some(on) = crate::switched(_name) {
         return on;
     }
     default()

@@ -3,12 +3,14 @@ param(
     [string] $Tag = 'ab-batch-port7-1',
     [double] $PrivateLimitGb = 28.0,
     [int] $MaxMinutes = 8,
-    [int] $MinDraws = 3000,
+    [double] $DenseGateMinutes = 5.0,
+    [double] $MinDraws = 3000,
     [int[]] $CycleEnds = @(7, 11, 15, 19, 23)
 )
 
 $root = 'C:\mygame\victory-work'
 $log = Join-Path $root "$Tag-stderr.txt"
+$stopFile = Join-Path $root "$Tag-stop.txt"
 $deadline = (Get-Date).AddMinutes($MaxMinutes)
 $hardDeadline = $deadline.AddMinutes(15)
 $reason = 'timeout'
@@ -24,6 +26,10 @@ function Get-PhaseDraws {
     return $draws
 }
 
+function Has-DensePhase {
+    @((Get-PhaseDraws).Values | Where-Object { $_ -ge $MinDraws }).Count -gt 0
+}
+
 function TranslationBusy {
     $lines = @(Get-Content $log -Tail 60 -ErrorAction SilentlyContinue)
     foreach ($line in $lines) {
@@ -37,6 +43,14 @@ function TranslationBusy {
 while ((Get-Date) -lt $hardDeadline) {
     $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
     if (-not $p -or $p.HasExited) { $reason = 'exited'; break }
+
+    # Cold menu/translation sessions are useless A/Bs. Time the gate from the
+    # game's own start, not from when this watcher happened to be launched.
+    if (-not (Has-DensePhase) -and (Get-Date) -ge $p.StartTime.AddMinutes($DenseGateMinutes)) {
+        $reason = "no dense gameplay within $DenseGateMinutes minutes"
+        $busy = TranslationBusy
+        break
+    }
 
     $busy = TranslationBusy
     if ((Get-Date) -ge $deadline -and $busy) {
@@ -60,6 +74,8 @@ while ((Get-Date) -lt $hardDeadline) {
 
 if ($busy -and $reason -eq 'timeout') { $reason = 'busy at hard deadline' }
 "STOP_REASON=$reason"
-if ($reason -ne 'exited' -and -not $busy) {
+"STOP_REASON=$reason" | Set-Content -LiteralPath $stopFile -Encoding ascii
+$gateAbort = $reason -like 'no dense gameplay*'
+if ($reason -ne 'exited' -and (-not $busy -or $gateAbort)) {
     taskkill /PID $TargetPid /F /T
 }

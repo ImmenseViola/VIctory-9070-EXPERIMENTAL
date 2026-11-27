@@ -1,6 +1,8 @@
 //! Renderer port #7: the submitting lane's last waits
 //! (`VICTORY_PORT_JOURNAL=1`, off by default; the switch is
-//! [`crate::watch::port_journal`]).
+//! [`crate::watch::port_journal`]). Cut 3's safe early-round form
+//! (`VICTORY_HEAP_SYNC_SAFE`, off by default) reuses this module's mark/ask
+//! path without turning on port #7's journal sharding.
 //!
 //! What the lane ("victory-submit", `crate::queue`'s line) waited for most
 //! with ports 1, 2, 5 and 6 on (runs guard-4, guard-6, merge-4): the heaps'
@@ -34,9 +36,36 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Whether the switch is on (`crate::watch::port_journal`).
+/// Whether the mark/ask path is on: renderer port #7, or Cut 3's safe
+/// early-round form. The journal's lock sharding still follows only
+/// [`crate::watch::port_journal`].
 pub(crate) fn on() -> bool {
-    crate::watch::port_journal()
+    crate::watch::port_journal() || safe_heap_sync()
+}
+
+/// Cut 3: ask a real heap-sync round earlier, through the existing
+/// [`crate::descriptor::round_after_now`] path, and carry its mark through
+/// this module and the submitting lane. The wait point
+/// (`crate::descriptor::SyncedHeaps::drop`) and the round's completion point
+/// (`crate::descriptor`'s `Over::drop`) are unchanged. Off by default;
+/// `VICTORY_AB=<s>,VICTORY_HEAP_SYNC_SAFE` compares it in one run.
+pub(crate) fn safe_heap_sync() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_SAFE") {
+        return on;
+    }
+    #[cfg(test)]
+    if SAFE_HEAP_SYNC_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_SYNC_SAFE").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`safe_heap_sync`], for what this thread does.
+    pub(crate) static SAFE_HEAP_SYNC_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ---------------------------------------------------------------------------
@@ -125,13 +154,25 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
     STATS[count].fetch_add(1, Relaxed);
 }
 
-/// Whether the switch is on, or changes in this run (`VICTORY_AB`).
+/// Whether either switch is on, or changes in this run (`VICTORY_AB`).
 fn named() -> bool {
     #[cfg(feature = "diagnostics")]
-    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
+    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() || crate::ab::bit("VICTORY_HEAP_SYNC_SAFE").is_some() {
         return true;
     }
     on()
+}
+
+/// The switch to name in the frame line.
+fn named_switch() -> &'static str {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_HEAP_SYNC_SAFE").is_some() {
+        return "VICTORY_HEAP_SYNC_SAFE";
+    }
+    if safe_heap_sync() && !crate::watch::port_journal() {
+        return "VICTORY_HEAP_SYNC_SAFE";
+    }
+    "VICTORY_PORT_JOURNAL=1"
 }
 
 /// Renderer port #7's line of the frame lines, per frame.
@@ -146,9 +187,10 @@ pub(crate) fn line(frames: f64) {
     // covers both).
     let (on_ms, off_ms) = (s[HEAPS_NS_ON] / 1e6 / f, s[HEAPS_NS_OFF] / 1e6 / f);
     tracing::info!(
-        "renderer port 7 (VICTORY_PORT_JOURNAL=1) per frame: heaps' records: the lane waited {on_ms:.2} ms ({:.1} preparings) with \
+        "renderer port 7 ({}) per frame: heaps' records: the lane waited {on_ms:.2} ms ({:.1} preparings) with \
          the switch, {off_ms:.2} ms ({:.1}) without; {:.1} rounds asked for at the title's submit, {:.1} preparings found theirs \
          asked earlier, {:.1} asked it at the preparing, {:.1} had no mark; {:.1} preparings wrote a heap's memory; journal: {}",
+        named_switch(),
         s[HEAPS_ON] / f,
         s[HEAPS_OFF] / f,
         s[ROUNDS_ASKED] / f,
@@ -178,6 +220,43 @@ mod tests {
         assert_eq!(round_after(4, 2), (4, false));
         // Everything done: ask anew.
         assert_eq!(round_after(7, 7), (8, true));
+    }
+
+    /// Cut 3 takes the same mark/ask decision as renderer port #7, without
+    /// turning on that port's journal sharding, and changes no round decision.
+    #[test]
+    fn safe_heap_sync_uses_the_same_mark_decision() {
+        SAFE_HEAP_SYNC_IN_TEST.set(false);
+        crate::watch::PORT_JOURNAL_IN_TEST.set(false);
+        PREP_FLOOR.store(0, Relaxed);
+        set_mark(0);
+        assert!(!on());
+        assert_eq!(needed(), 0);
+
+        PREP_FLOOR.store(3, Relaxed);
+        set_mark(7);
+        SAFE_HEAP_SYNC_IN_TEST.set(true);
+        assert!(safe_heap_sync());
+        assert!(on());
+        assert!(!crate::watch::port_journal());
+        assert_eq!(needed(), 7);
+
+        crate::watch::PORT_JOURNAL_IN_TEST.set(true);
+        SAFE_HEAP_SYNC_IN_TEST.set(false);
+        assert!(crate::watch::port_journal());
+        assert_eq!(needed(), 7);
+
+        for (asked, done, expected) in [(0, 0, (1, true)), (3, 2, (4, true)), (5, 2, (5, false)), (7, 7, (8, true))] {
+            SAFE_HEAP_SYNC_IN_TEST.set(false);
+            assert_eq!(round_after(asked, done), expected);
+            SAFE_HEAP_SYNC_IN_TEST.set(true);
+            assert_eq!(round_after(asked, done), expected);
+        }
+
+        crate::watch::PORT_JOURNAL_IN_TEST.set(false);
+        SAFE_HEAP_SYNC_IN_TEST.set(false);
+        PREP_FLOOR.store(0, Relaxed);
+        set_mark(0);
     }
 
     /// A simulation of the rounds' thread: whatever the times of asking,

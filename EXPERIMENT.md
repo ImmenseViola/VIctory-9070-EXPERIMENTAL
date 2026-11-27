@@ -44,6 +44,7 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b: first run black/idle; one retry confounded by scene mismatch; stays off |
 | `VICTORY_WIDE_THREADS_MAX` | off (default helper count) | — | Fixed pool ceiling for cut 1b, not an A/B switch on its own |
 | `VICTORY_PENDING_INDEX` | off | `VICTORY_PENDING_INDEX` | Cut 2: A/B confounded and crashed with the same title-image fault as Cut 1a; stays off |
+| `VICTORY_HEAP_SYNC_SAFE` | off | `VICTORY_HEAP_SYNC_SAFE` | Cut 3: safe early heap-sync round; implemented, unit-tested, awaiting its own game A/B |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -84,13 +85,17 @@ a separate host-side harness and stays blocked.
 
 ### Cut 1a: `VICTORY_REFRESH_FINE_JOBS`
 
-`host::fine_spans` cuts a refresh span into at most four jobs, never below
-`256 KiB` a job, before the wide dispatch in `refresh_spans`, `refresh_ahead`,
-and `flush_all`. It changes only which worker claims which bytes: the byte
-union, span order, `ahead` marking, ask windows, and title-write boundaries are
-unchanged. Off by default; named in `VICTORY_AB`, the phase decides it at every
-present. `host.rs::tests::fine_refresh_jobs_have_the_same_bytes_in_the_same_order`
-asserts identical bytes and order, including empty and short spans.
+`host::fine_spans` cuts a refresh span into at most four jobs before the wide
+dispatch in `refresh_spans`, `refresh_ahead`, and `flush_all`. Internal
+boundaries are page-aligned, and 64 KiB-aligned where the span can hold pieces
+that large; no piece is below 4 KiB unless the original span is shorter. It
+changes only which worker claims which bytes: the byte union, span order,
+`ahead` marking, ask windows, and title-write boundaries are unchanged. Off by
+default; named in `VICTORY_AB`, the phase decides it at every present.
+`host.rs::tests::fine_refresh_jobs_have_the_same_bytes_in_the_same_order`
+asserts identical bytes and order, including empty and short spans;
+`host.rs::tests::fine_refresh_jobs_are_page_aligned_and_do_not_share_pages`
+asserts that no two jobs of one shadow touch the same 4 KiB page.
 
 ### Cut 1b: `VICTORY_WIDE_REFRESH_MORE`
 
@@ -126,10 +131,38 @@ copy functions. The one game A/B was confounded and crashed with the same
 `victory-image-b99f876b74d4a77f.dll+0x2215c35` write-to-null fault as Cut 1a, so
 the switch stays off and no retry was made.
 
+### Cut 3: `VICTORY_HEAP_SYNC_SAFE`
+
+`port_journal::on()` also accepts this fresh, off-by-default switch. It makes
+the same askers (`queue::behind`'s submit-time marks) and the same waiter
+(`host`'s prepare-time `needed()`) use the existing mark path:
+`descriptor::round_after_now()` asks a real heap-sync round earlier and the
+mark is carried through `port_journal::set_mark`/`needed`. It does **not** turn
+on renderer port #7's journal sharding; `watch::port_journal()` still controls
+that separately.
+
+Unchanged: `descriptor::Over::drop` is still the only event that advances a
+round's `done`; timed early rounds still do not complete a caller's round;
+`descriptor::SyncedHeaps::drop` is still the wait point; and `make_waiting()`
+stays after that wait. No list bytes, submissions, waits, or round decisions
+move.
+
+`port_journal::tests::safe_heap_sync_uses_the_same_mark_decision` asserts that
+with the switch off no mark is used, with it on the same mark/floor decision is
+used as the old port #7 path while the journal sharding remains off, and that
+`round_after(asked, done)` gives the same result in both states.
+
 ## Game A/B protocol
 
-- warmed cache `victory-7900-clean-cache-1`
-- `VICTORY_LATE_WAIT=3`
+- warmed cache `victory-7900-clean-cache-1`; the harness now defaults to
+  `victory-9070-cache-v3-fixed`, a copy with identical `known-pipelines.bin`,
+  `known-shaders.bin` and `host-pipelines.bin`. If the manual driver-cache warm
+  run does not restore time-to-gameplay, run the next baseline with
+  `-Cache 'C:\mygame\victory-work\victory-7900-clean-cache-1'` before judging any
+  cut.
+- `VICTORY_LATE_WAIT=3`, fixed in `tools/harness-env.ps1`: stage 3 is what
+  `copy-stages-5` and the previous A/B protocol used. Do not override it for
+  the warm run, baseline or any cut.
 - `VICTORY_AB=20,VICTORY_TEX_VIEW_CACHE`
 - passive screen/motion/memory monitor
 - watcher stops at phase 7 or 29.5 GB private and refuses to kill during
@@ -241,7 +274,7 @@ supply the ~15 ms needed for 30 fps, so the order is:
 7. Full heap-texture aside — only after an ahead-job refactor that can carry
    texture uploads and barriers safely.
 
-Cuts 1a and 1b are implemented off by default and awaiting their own A/B runs.
+Cuts 1a, 1b and 3 are implemented off by default and awaiting their own A/B runs.
 Nothing is promoted to a default without a clean run and the user's visual
 check.
 

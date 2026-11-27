@@ -9,9 +9,11 @@ for your own setup.
 | Script | Purpose |
 |---|---|
 | `start-play-session.ps1` | Launch a tagged game session with the tuned environment, optional binary, cache, console/upscaler, and `-Extra` switches. |
+| `harness-env.ps1` | The single source of the tuned environment variables, shared by the launcher and the cache probe; do not duplicate its table. |
+| `cache-fingerprint.ps1` | Run `victory warm` with the exact harness environment. Default (`-Limit 0`) only prints the current pipeline fingerprint and counts; `-Warm` tops up early pipelines for that fingerprint. |
 | `monitor-active.ps1` | Passive screen/motion/memory/FPS sampler; writes `<tag>-monitor.csv`. |
-| `summarize-ab.ps1` | Group `A/B phase` log lines by switch bits and print mean/median/p90/draws. |
-| `stop-after-clean-ab.ps1` | Stop a run at a chosen phase or private-memory limit; refuses to kill while shader translation or host pipeline creation is active. |
+| `summarize-ab.ps1` | Group `A/B phase` log lines by switch bits and print mean/median/p90/draws; dense phases only (default `>= 3000` draws). |
+| `stop-after-clean-ab.ps1` | Stop a run at a chosen phase or private-memory limit; aborts if dense gameplay has not appeared within 5 minutes of process start, otherwise refuses to kill while shader translation or host pipeline creation is active. |
 | `measure-perf.ps1` | 60 s log-window frame-time/copy/texture sampler; writes `<tag>-perf.csv`. |
 | `ocr-shot.ps1` | OCR the overlay from a captured frame, for passive checks without input. |
 
@@ -21,7 +23,7 @@ Typical A/B launch:
 & .\tools\start-play-session.ps1 -Tag texview-ab2 `
   -Binary ..\target-exp\diag\victory.exe `
   -Console series-x -Upscaler 6 `
-  -Cache 'C:\mygame\victory-work\victory-7900-clean-cache-1' `
+  -Cache 'C:\mygame\victory-work\victory-9070-cache-v3-fixed' `
   -Extra @{
     VICTORY_CARD_BUFFERS_MIN_MB='1'
     VICTORY_LATE_WAIT='3'
