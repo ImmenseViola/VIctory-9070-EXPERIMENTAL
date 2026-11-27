@@ -40,9 +40,10 @@ behaviour, or use `VICTORY_AB` to compare both sides in one run.
 | Switch | Default here | A/B name | Status |
 |---|---|---|---|
 | `VICTORY_TEX_VIEW_CACHE` | **on** | `VICTORY_TEX_VIEW_CACHE` | Clean dense A/B win (mostly mean/p90, median only 1–3 ms); user visual check done, no cache-specific artifact seen |
-| `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a implemented, awaiting A/B |
-| `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b implemented, awaiting A/B |
+| `VICTORY_REFRESH_FINE_JOBS` | off | `VICTORY_REFRESH_FINE_JOBS` | Cut 1a: one game run never reached gameplay and crashed; stays off |
+| `VICTORY_WIDE_REFRESH_MORE` | off | `VICTORY_WIDE_REFRESH_MORE` | Cut 1b: first run black/idle; one retry confounded by scene mismatch; stays off |
 | `VICTORY_WIDE_THREADS_MAX` | off (default helper count) | — | Fixed pool ceiling for cut 1b, not an A/B switch on its own |
+| `VICTORY_PENDING_INDEX` | off | `VICTORY_PENDING_INDEX` | Cut 2 implemented, equivalence-tested, awaiting A/B |
 
 A switch named in `VICTORY_AB=<seconds>,<name>` no longer follows its own
 environment value; the A/B phases decide it.
@@ -100,7 +101,28 @@ The atomic index counter still hands every number to exactly one claimer, so
 only who does a piece changes. Off by default and A/B-able. Extra helpers wait
 without spinning while off, and a raise wakes them before jobs are queued.
 `shadow.rs::more_wide_tests::more_helpers_claim_the_same_work` asserts identical
-index coverage for three, seven, and nine claimers.
+index coverage for three, seven, and nine claimers. Both game A/Bs were
+confounded: the first never left the black title screen, and the one allowed
+retry reached gameplay only on the on side's visual samples (off-side luma gap
+`28.3`, non-black gap `85.6` points) despite all frame deltas being draws. No
+further retry is allowed and the switch stays off.
+
+### Cut 2: `VICTORY_PENDING_INDEX`
+
+`shadow::Pending` keeps the old `pending` vector authoritative and in insertion
+order; a sorted `(start, end, position)` index with prefix maxima only answers
+the overlap questions previously answered by linear scans. It is used by
+`send_copied`, `writing`, `copy_back_done`, `writes_pending_in`,
+`stale_under_writes`, `merge_under_writes`, `update`, and `nothing_new`. It does
+not touch `Batch.ahead`, submission ordering, ask windows, or title-write
+boundaries, and it has no cached skip decision. Off by default and A/B-able; a
+query rebuilds from the vector whenever the index is absent or stale.
+
+`shadow.rs::pending_index_tests` compares indexed answers with the old scans
+for nested, touching, duplicate, and empty ranges, after every push and retain,
+and over dense query ranges. It asserts identical overlap booleans, identical
+insertion-order ranges after clipping, and identical byte gaps passed to the
+copy functions.
 
 ## Game A/B protocol
 
@@ -112,7 +134,9 @@ index coverage for three, seven, and nine claimers.
   shader/pipeline creation
 - no manual input during automated runs
 - Enter-only key schedule including world entry (`2/5/8/11/20/75/78:Enter`),
-  no movement or camera keys, so matched phases share one scene
+  no movement or camera keys, so matched phases share one scene; if translation
+  outlasts the early presses, a later Enter-only window
+  (`150-156/210-216/270:Enter`) is entry assistance, not a second cut variable
 
 `VICTORY_AB=20,VICTORY_HEAP_SYNC_EARLY` is done: no regression, possible 1–2 ms,
 mechanism unconfirmed and confounded by movement/frame differences. Early rounds

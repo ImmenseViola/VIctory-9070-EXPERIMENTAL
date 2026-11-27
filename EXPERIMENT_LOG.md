@@ -529,3 +529,143 @@ Final label: **confounded** from the full-report rule (mean delta on-off
 additional title crash during phase 87. Per the run rule, there is no retry:
 `VICTORY_REFRESH_FINE_JOBS` remains off by default and Cut 1a is not a win.
 The game is fully closed.
+
+## Cut 1b game A/B started (2026-11-27)
+
+`cut1b-wide-1` launched at `02:54:45+02:00` as pid `5008` with the warmed
+version-3 cache, `series-s`, upscaler `6`, Enter-only schedule,
+`VICTORY_AB=20,VICTORY_WIDE_REFRESH_MORE`, `VICTORY_WIDE_THREADS_MAX=6` fixed
+for both phases, and `VICTORY_COPY_STAGES=1` for stage attribution. The fixed
+thread maximum is required: with the default pool the named switch would only
+change the refresh-thread count and could confuse the A/B. A quiet-window
+Enter helper, passive visual/memory monitor, and non-killing phase stopper are
+being attached. No result or label yet.
+
+Cut 2 is implemented behind `VICTORY_PENDING_INDEX`, off by default and
+A/B-able. `shadow::Pending` keeps the old `pending` vector authoritative in
+insertion order; a sorted `(start, end, index)` list with prefix maxima answers
+overlap questions only. `send_copied`, `writing`, `copy_back_done`,
+`writes_pending_in`, `stale_under_writes`, `merge_under_writes`, `update`, and
+`nothing_new` use the same overlap answers as before. No `Batch`, `ahead`,
+submission, ask-window, watchdog, or title-write code changed; there is no
+cached skip decision. Mutation invalidates or rebuilds the index; queries
+rebuild from the vector when needed.
+
+`shadow.rs::pending_index_tests` was added before any game run. It asserts that
+indexed and unindexed paths return the same overlap booleans, the same
+insertion-order ranges after clipping, the same exact-range answers, and the
+same byte gaps from `outside()` for nested, touching, duplicate, empty, and
+randomly mutated ranges. `cargo check -p victory-gpu --all-features --locked`,
+`cargo test -p victory-gpu --all-features --locked`,
+`cargo clippy -p victory-gpu --all-targets --all-features --locked -- -D warnings`,
+and `git diff --check` passed. The diag binary build is deferred until Cut 1b
+closes so the running game is not disturbed. No default changed; no Cut 2 game
+run yet.
+
+Cut 3 was mapped read-only. The safe form is a new off-by-default A/B switch
+(not named yet, so there is no documented switch to read) that asks a real
+heap-sync round earlier
+through `descriptor::round_after_now()`, carries the returned mark through
+`port_journal`/`queue::behind`, and still waits on that mark at the unchanged
+`host.rs:6069` drop point. Only `descriptor::Over::drop` may advance the
+round's `done`; asker-side notifications and timed early rounds must not. A
+diagnostics-only extra split can report the heap wait and `make_waiting()`
+separately without moving work. Unsafe variants are treating timed early rounds
+as completed, releasing waits at ask time, dropping `heaps_synced` earlier,
+moving `make_waiting()` before the wait, or reusing
+`VICTORY_HEAP_SYNC_EARLY`/`VICTORY_PORT_JOURNAL` (already A/B'd or bundled with
+journal sharding). No Cut 3 code was added. The first full workspace test
+run failed only because that read-only note named a prospective switch that no
+Rust source reads; the name was removed from the note and full verification was
+restarted. The rerun passed `cargo check --workspace --all-features --locked`,
+`cargo test --workspace --all-features --locked`,
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+and `git diff --check`.
+
+### Cut 1b first game A/B result (2026-11-27)
+
+`cut1b-wide-1` stopped cleanly at its timeout with no fault or crash string.
+Full report: `C:\mygame\victory-work\cut1b-wide-1-full-report.txt`; phases
+`80..91`, six matched pairs.
+
+- Off: 6 phases, 3418 frames, mean of means `33.38 ms`, mean of medians
+  `33.3 ms`, max p90 `33.6 ms`, `1.00` draw/frame.
+- On (`VICTORY_WIDE_REFRESH_MORE`): 6 phases, 3419 frames, mean of means
+  `33.35 ms`, mean of medians `33.3 ms`, max p90 `33.6 ms`, `1.00` draw/frame.
+- Matched pair mean deltas (on minus off): `80→81 +0.0`, `82→83 -0.5`,
+  `84→85 +0.0`, `86→87 +0.0`, `88→89 +0.0`, `90→91 +0.3` ms; median delta
+  `0.0` for every pair, p90 delta `0.0` for every pair, draw ratio `1.000`.
+- Monitor: off side 23 samples, mean luma `7.9`, non-black `5.2%`, mean private
+  `6.75 GB`, max `7.13 GB`; on side 1 sample, luma `7.9`, non-black `5.2%`,
+  private `7.13 GB`; luma gap `0`, non-black gap `0` points.
+- Stages were idle-gameplay stages only: refresh recording and worker stage
+  `0.02–0.51 ms` with `0.00 ms` summed worker CPU and `0` worker jobs,
+  critical-path lists `0.0–0.7 ms` in `1–91` flushes, heap waits `0.1–0.3 ms`
+  late in the parsed window, and title work/elsewhere about `33.1–33.2 ms`.
+  The game never entered the world; it stayed at a black `Americas` screen with
+  `1` draw/frame. The quiet-window Enter helper did not move it into gameplay.
+
+Final label: **confounded** (no usable gameplay, matched draws are idle-screen
+draws). The automatic helper's `no regression` label is not accepted because
+the run never reached the measured scene. No crash occurred, so the one allowed
+confounded retry is used below with a late Enter-only injected key window; the
+cut variable remains the same.
+
+A single confounded retry, `cut1b-wide-2`, launched at `03:33:33+02:00` as pid
+`8460` with the same binary, cache, console, upscaler, A/B switch, fixed
+`VICTORY_WIDE_THREADS_MAX=6`, and stage instrumentation. The only harness change
+is a later **Enter-only injected key window** (`150-156:Enter`, `210-216:Enter`,
+`270:Enter` in addition to the original early Enters): the first run's injected
+keys fired while the title was still not accepting world entry, and OS-level
+Enter through the quiet-window helper did not reach the start screen. This is
+entry assistance, not a second cut variable; no movement/camera key is used.
+Passive visual/memory monitoring and the non-killing phase stopper are attached.
+No result or label yet.
+
+Interim observation: by phase `42` (`01:47:56Z`) the retry was still at
+`1` draw/frame on the same black `Americas` screen. A later log scan found
+`233–1054` pipelines "being made" through `01:49Z` and fresh
+`shader translated stage="pixel"` / `host pipeline shaders=` lines at
+`01:53–01:54Z`, so shader translation, not the injected Enter window, was still
+blocking world entry. Cropped OCR found no title text outside the diagnostic
+panel. A `tools/stop-when-idle.ps1` helper was added so a game left alive at the
+hard deadline can be closed only after a quiet log window.
+
+### Cut 1b retry final result (2026-11-27) -- CONFOUNDED, no retry left
+
+The retry eventually reached gameplay at about `02:08Z`: phases `104–119`
+(`02:08:36Z–02:13:36Z`) are `11` draws/frame with visible `Americas`
+(luma `38.2`, non-black `96.6–96.7%`). The stopper ended it at its hard
+deadline (`04:14+02:00`, `STOP_REASON=timeout`) with no crash and no victory
+process left. Full report:
+`C:\mygame\victory-work\cut1b-wide-2-full-report.txt`.
+
+- Frame phases: off `33.3 ms` mean of means, `33.3 ms` mean of medians, max p90
+  `33.6 ms` over 8 phases/`4562` frames; on `33.3 / 33.3 / 33.6 ms` over 8
+  phases/`4565` frames. All 8 matched pairs were draws (`0 ms` mean, median,
+  and p90 deltas), with equal `11` draws/frame (`ratio 1`).
+- Visual/memory: the off side has 31 monitor samples, but 30 are the black idle
+  title (`7.9–8.0` luma, `5.1–5.2%` non-black) and only one is gameplay;
+  the on side has 3 gameplay samples. Side means are luma `9.9` off vs `38.2`
+  on (`28.3` gap) and non-black `11.1%` vs `96.7%` (`85.6` point gap), far
+  beyond the `~5` point confound threshold. Private memory was `6.8–7.42 GB`
+  off and `7.42 GB` on, far below the `29.5 GB` limit.
+- Stages in the usable window were tiny on both sides: copy recording
+  `0.00–0.02 ms`, refresh flush workers `0.00–0.01 ms` with `0` worker jobs,
+  critical-path list/recording `0.0 ms`, heap waits `0.1 ms` at most, sends
+  `0.1 ms`, and `12` refreshes of `11.6 MB`/frame. This scene does not exercise
+  the large refresh path seen in the active-gameplay baseline.
+
+Final label: **confounded**. The equal phase numbers and all-draw pairs are not
+a clean win because the sides do not show the same scene; the one allowed
+confounded retry has now been used, so there is no further retry. No crash or
+fault occurred. `VICTORY_WIDE_REFRESH_MORE` stays off and is recorded as not a
+proven optimisation.
+
+Cut 2 pre-commit verification passed: `cargo check --workspace --all-features
+--locked`, `cargo test --workspace --all-features --locked`,
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+`git diff --check`, and `cargo build --locked --profile diag -p victory
+--features diagnostics`. The switch table and A/B protocol were then updated to
+record Cut 1b's final label and the late Enter-only entry window, so the full
+verification is being rerun once more before the commit. No default changed.
