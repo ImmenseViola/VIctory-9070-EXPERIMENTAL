@@ -1,5 +1,10 @@
 # RDNA4 / RX 9070 notes (2026-11-26)
 
+> This is the EXPERIMENTAL fork. These notes are inherited from the tuned tree;
+> the switch that is on by default here and its A/B results are in
+> [../EXPERIMENT.md](../EXPERIMENT.md) and
+> [../EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md).
+
 These are the changes made after the tuned RX 7900 XTX build was ported to an
 RX 9070. The 7900 XTX numbers and the larger speed work stay in
 [findings.md](findings.md); this file is the AMD compiler and skinning work

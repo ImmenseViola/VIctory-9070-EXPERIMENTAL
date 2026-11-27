@@ -1,9 +1,11 @@
-name: CI
+name: CI (EXPERIMENTAL fork)
 
+# This fork changes defaults, so the working branch needs the same clippy and
+# test gate as main. Both refs are pushed to on every commit.
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, experimental/texture-pass-aside]
 
 permissions:
   contents: read
